@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-login.py - Audius login + developer app creation + localStorage capture.
+login.py - Re-create dev apps for previously-failed accounts and save new app_data.
 """
 
 import asyncio
@@ -8,12 +8,9 @@ import json
 import random
 import re
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
 
 from playwright.async_api import async_playwright
 from supabase import create_client
-
-import rpc
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -23,7 +20,52 @@ NAME_FILE       = ROOT_DIR / "name.txt"
 TEMPMAIL_SCRIPT = SCRIPT_DIR / "tempmail.py"
 IMG_SCRIPT      = SCRIPT_DIR / "img.py"
 
-MAX_RUNS = 10
+# ============================================================
+# Accounts to re-run (previously failed because app wasn't authorized)
+# ============================================================
+FAILED_ADDRESSES = [
+    "927de440@tiffincrane.com",
+    "86c64024@tiffincrane.com",
+    "e9b368f8@tiffincrane.com",
+    "9ace44d0@tiffincrane.com",
+    "5ea8e14c@tiffincrane.com",
+    "e5477e86@tiffincrane.com",
+    "12b2188e@tiffincrane.com",
+    "c73b179e@tiffincrane.com",
+    "1853067b@tiffincrane.com",
+    "8afe2f7d@tiffincrane.com",
+    "1c22738e@tiffincrane.com",
+    "be3c883d@fldubai.com",
+    "689cd718@tiffincrane.com",
+    "acf5652a@tiffincrane.com",
+    "67d2b98a@tiffincrane.com",
+    "0448d2a5@tiffincrane.com",
+    "768bdbd6@tiffincrane.com",
+    "ffcb2ae1@fldubai.com",
+    "26ffa8c3@tiffincrane.com",
+    "068c28ab@tiffincrane.com",
+    "f9d0035d@tiffincrane.com",
+    "be0c07e6@tiffincrane.com",
+    "1ed2027f@fldubai.com",
+    "49663468@tiffincrane.com",
+    "83ea8015@tiffincrane.com",
+    "c40079ee@tiffincrane.com",
+    "2c1f4399@tiffincrane.com",
+    "bbf799e1@tiffincrane.com",
+    "aace2710@tiffincrane.com",
+    "3c5eabe9@tiffincrane.com",
+    "52ed0cdf@tiffincrane.com",
+    "8ad232dd@tiffincrane.com",
+    "cdeaf82d@tiffincrane.com",
+    "716f1879@tiffincrane.com",
+    "580dadf6@tiffincrane.com",
+    "c50cbbf4@tiffincrane.com",
+    "478ae935@tiffincrane.com",
+    "096226c5@tiffincrane.com",
+    "87e59529@tiffincrane.com",
+    "8147b8f2@tiffincrane.com",
+    "90834cb9@tiffincrane.com",
+]
 
 # --- Desktop Chrome UA pool ---
 DESKTOP_CHROME_UAS = [
@@ -73,6 +115,21 @@ IMAGE_CLICK_SELECTORS = [
     'img[src^="data:image"]', 'img[src^="blob:"]',
     'button[aria-label="Upload a profile photo"]', 'label:has(img)',
 ]
+
+# XPaths / fallbacks for the developer-app flow
+MANAGE_APPS_SELECTORS = [
+    'xpath=/html/body/div[1]/div[1]/div[2]/div[3]/div/div[2]/div/div[1]/div[15]/button',
+    'button:has-text("Manage your apps")',
+    'button:has-text("Manage Apps")',
+    'a:has-text("Manage your apps")',
+]
+
+NEW_BTN_SELECTORS = [
+    'xpath=/html/body/div[5]/div/div/div/div[2]/div/div/div[1]/div/div/div/div/button',
+    'button:has-text("New")',
+]
+
+CREATE_KEY_XPATH = "/html/body/div[5]/div/div/div/div[2]/div/div/div[1]/div/form/div[4]/button[2]"
 
 
 # --------------------------------------------------------------------------
@@ -199,17 +256,6 @@ def _shorten(value: str, head: int = 20, tail: int = 6) -> str:
     return f"{value[:head]}...{value[-tail:]}" if len(value) > head+tail+3 else value
 
 
-async def heartbeat_loop(supabase, address: str):
-    while True:
-        await asyncio.sleep(30)
-        try:
-            await asyncio.to_thread(
-                supabase.rpc("ping_audius_account", {"p_address": address}).execute
-            )
-        except Exception:
-            pass
-
-
 # --------------------------------------------------------------------------
 # Complete an incomplete signup wizard
 # --------------------------------------------------------------------------
@@ -298,46 +344,98 @@ async def complete_incomplete_signup(page) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Developer Settings & App Creation
+# Developer Settings & App Creation (with Manage Apps retry + refresh)
 # --------------------------------------------------------------------------
+async def open_manage_apps(page) -> bool:
+    """Clicks 'Manage your apps'; refreshes the settings page up to 5 times if needed."""
+    for attempt in range(1, 6):
+        print(f"  -> clicking 'Manage your apps' (attempt {attempt}/5)")
+        try:
+            # click manage-apps via first matching selector
+            clicked = False
+            for sel in MANAGE_APPS_SELECTORS:
+                try:
+                    loc = page.locator(sel).first
+                    await loc.wait_for(state="visible", timeout=10_000)
+                    await loc.click()
+                    print(f"     manage apps clicked via: {sel}")
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                raise RuntimeError("no manage-apps selector matched")
+
+            # verify the New-app modal appeared
+            for sel in NEW_BTN_SELECTORS:
+                try:
+                    await page.locator(sel).first.wait_for(state="visible", timeout=8_000)
+                    print("     manage-apps dialog opened")
+                    return True
+                except Exception:
+                    continue
+            raise RuntimeError("New-app dialog did not appear")
+
+        except Exception as e:
+            print(f"  [!] manage apps attempt {attempt} failed: {e}")
+            print("  -> refreshing settings page...")
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                await page.wait_for_timeout(3000)
+            except Exception as re_err:
+                print(f"  [!] reload failed ({re_err}); re-navigating to /settings")
+                try:
+                    await page.goto("https://audius.co/settings",
+                                    wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(3000)
+                except Exception as nav_err:
+                    print(f"  [!] navigation failed: {nav_err}")
+                    return False
+    return False
+
+
 async def create_app_and_extract_credentials(page, captured: dict) -> dict:
-    """Navigates settings -> Manage apps -> Create app -> extracts credentials via network."""
+    """Settings -> Manage apps (with retry) -> New -> fill name -> Create key."""
     print("[*] Navigating to settings...")
     await page.goto("https://audius.co/settings", wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_timeout(3000)
 
-    # Click "Manage your apps"
-    manage_apps_xpath = "/html/body/div[1]/div[1]/div[2]/div[3]/div/div[2]/div/div[1]/div[15]/button"
-    print("  -> clicking 'Manage your apps'")
-    await page.locator(f"xpath={manage_apps_xpath}").click()
-    await page.wait_for_timeout(2000)
+    if not await open_manage_apps(page):
+        print("[!] Could not open 'Manage your apps' after 5 attempts")
+        return {"api_key": "", "api_secret": "", "bearer_token": ""}
 
     # Click "New"
-    new_btn_xpath = "/html/body/div[5]/div/div/div/div[2]/div/div/div[1]/div/div/div/div/button"
     print("  -> clicking 'New'")
-    await page.locator(f"xpath={new_btn_xpath}").click()
+    try:
+        await click_first_match(page, NEW_BTN_SELECTORS, per_selector_timeout=10_000)
+    except RuntimeError as e:
+        print(f"[!] Could not click 'New': {e}")
+        return {"api_key": "", "api_secret": "", "bearer_token": ""}
     await page.wait_for_timeout(2000)
 
     app_name = generate_handle()
 
-    # Fill App Name
     print(f"  -> filling app name: {app_name}")
-    await page.fill('input[aria-label="App Name"]', app_name)
+    try:
+        await page.fill('input[aria-label="App Name"]', app_name)
+    except Exception as e:
+        print(f"[!] App Name input not found: {e}")
+        return {"api_key": "", "api_secret": "", "bearer_token": ""}
 
-    # Wait for "Create key" button to be ready
-    create_key_xpath = "/html/body/div[5]/div/div/div/div[2]/div/div/div[1]/div/form/div[4]/button[2]"
     print("  -> waiting for 'Create key' button")
-    await page.locator(f"xpath={create_key_xpath}").wait_for(state="visible", timeout=15_000)
+    try:
+        await page.locator(f"xpath={CREATE_KEY_XPATH}").wait_for(state="visible", timeout=15_000)
+    except Exception as e:
+        print(f"[!] 'Create key' button not visible: {e}")
+        return {"api_key": "", "api_secret": "", "bearer_token": ""}
 
-    # Setup network interception listeners *before* clicking Create Key
+    # Network interception listeners *before* clicking Create Key
     def on_request(request):
-        # 1. Extract API Key & Secret from register-api-key
         if "/register-api-key" in request.url:
             m = re.search(r"/developer-apps/0x([a-fA-F0-9]+)/register-api-key", request.url)
             if m:
                 captured["app_api_key"] = m.group(1)
                 print(f"  -> [NETWORK] Captured app_api_key: {captured['app_api_key']}")
-
             if request.post_data:
                 try:
                     body = json.loads(request.post_data)
@@ -348,11 +446,12 @@ async def create_app_and_extract_credentials(page, captured: dict) -> dict:
                     pass
 
     async def on_response(response):
-        # 2. Extract Bearer Token from access-keys
+        if "/register-api-key" in response.url and response.status >= 400:
+            print(f"  [!] register-api-key returned HTTP {response.status}")
         if "/access-keys" in response.url:
             try:
                 data = await response.json()
-                if "api_access_key" in data:
+                if isinstance(data, dict) and "api_access_key" in data:
                     captured["app_bearer_token"] = data["api_access_key"]
                     print(f"  -> [NETWORK] Captured app_bearer_token: {_shorten(captured['app_bearer_token'])}")
             except Exception:
@@ -361,64 +460,60 @@ async def create_app_and_extract_credentials(page, captured: dict) -> dict:
     page.on("request", on_request)
     page.on("response", on_response)
 
-    # Click "Create key"
     print("  -> clicking 'Create key'")
-    await page.locator(f"xpath={create_key_xpath}").click()
+    await page.locator(f"xpath={CREATE_KEY_XPATH}").click()
 
-    # Wait for the network requests to populate the captured data
     print("  -> waiting for network requests to finish...")
-    for _ in range(30):  # up to 15 seconds
+    for _ in range(40):  # up to 20s
         if all(k in captured for k in ("app_api_key", "app_api_secret", "app_bearer_token")):
             break
         await page.wait_for_timeout(500)
 
+    # small grace period so authorization propagates
+    await page.wait_for_timeout(3000)
+
     return {
         "api_key": captured.get("app_api_key", ""),
         "api_secret": captured.get("app_api_secret", ""),
-        "bearer_token": captured.get("app_bearer_token", "")
+        "bearer_token": captured.get("app_bearer_token", ""),
     }
 
 
-async def extract_local_storage(page) -> dict:
-    """Returns all localStorage data as a dictionary."""
-    print("[*] Extracting localStorage...")
+# --------------------------------------------------------------------------
+# Per-account worker
+# --------------------------------------------------------------------------
+async def process_account(pw, supabase, address: str) -> bool:
+    # ---- 1. Look up password from table ----
     try:
-        raw = await page.evaluate("() => JSON.stringify(localStorage)")
-        data = json.loads(raw) if raw else {}
-        print(f"  -> extracted {len(data)} localStorage keys")
-        return data
+        res = await asyncio.to_thread(
+            lambda: supabase.table("audius")
+                            .select("password")
+                            .eq("address", address)
+                            .execute()
+        )
     except Exception as e:
-        print(f"[!] Failed to extract localStorage: {e}")
-        return {}
+        print(f"[!] DB lookup failed for {address}: {e}")
+        return False
 
+    if not res.data:
+        print(f"[!] {address} not found in table")
+        return False
 
-# --------------------------------------------------------------------------
-# Main worker
-# --------------------------------------------------------------------------
-async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
-    account = rpc.claim("login")
-    while account and account["address"] in tried:
-        rpc.release(account["address"])
-        account = rpc.claim("login")
+    password = res.data[0].get("password")
+    if not password:
+        print(f"[!] {address} has no password stored")
+        return False
 
-    if account is None:
-        return False, None
-
-    address, password = account["address"], account["password"]
-    print(f"[*] Claimed account: {address}")
+    print(f"[*] Processing account: {address}")
 
     user_agent = read_user_agent()
-    print(f"[*] User agent: {user_agent}")
-
-    captured = {}
+    captured: dict = {}
     browser = await pw.chromium.launch(
         headless=False,
         args=["--disable-blink-features=AutomationControlled",
               "--disable-features=IsolateOrigins,site-per-process",
               "--no-sandbox", "--disable-dev-shm-usage"],
     )
-    success = False
-    ping_task = None
 
     try:
         context = await browser.new_context(
@@ -442,9 +537,7 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
                 pass
         await page.route("**/*", handle_route)
 
-        ping_task = asyncio.create_task(heartbeat_loop(supabase, address))
-
-        # --- Login flow ---
+        # ---- 2. Login ----
         await page.goto("https://audius.co/signin", wait_until="load", timeout=60_000)
         await page.fill('input[aria-label="Email"]', address)
         await page.fill('input[aria-label="Password"]', password)
@@ -453,8 +546,8 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         try:
             await click_first_match(page, LOGIN_BUTTON_SELECTORS)
         except RuntimeError as e:
-            print("[!] Could not click Log In:", e)
-            return False, address
+            print(f"[!] Could not click Log In: {e}")
+            return False
 
         try:
             await page.wait_for_url(
@@ -465,28 +558,26 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         except Exception:
             pass
 
-        # --- OTP Retrieval with X10 Retry ---
+        # ---- 3. OTP (up to 10 attempts) ----
         otp = None
-        for attempt in range(1, 4):
+        for attempt in range(1, 11):
             try:
                 stdout = await run_tempmail_inbox(address)
                 m = re.search(r"\d{3}\s\d{3}", stdout)
                 if m:
                     otp = m.group(0)
-                    print("[*] OTP:", otp)
+                    print(f"[*] OTP: {otp}")
                     break
-                else:
-                    print(f"[!] Attempt {attempt}/10: OTP not found in inbox.")
+                print(f"[!] Attempt {attempt}/10: OTP not found in inbox.")
             except Exception as e:
                 print(f"[!] Attempt {attempt}/10: tempmail inbox failed: {e}")
-            
+
             if attempt < 10:
-                print("    -> waiting 5s for email to arrive...")
                 await page.wait_for_timeout(5000)
-                
+
         if not otp:
             print("[!] Failed to retrieve OTP after 10 attempts.")
-            return False, address
+            return False
 
         await page.fill('input[aria-label="Code"]', otp)
         await page.wait_for_timeout(1000)
@@ -494,99 +585,130 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         try:
             await click_first_match(page, OTP_BUTTON_SELECTORS)
         except RuntimeError as e:
-            print("[!] Could not click OTP submit:", e)
-            return False, address
+            print(f"[!] Could not click OTP submit: {e}")
+            return False
 
         for _ in range(60):
             if "/feed" in page.url or "/signup" in page.url:
                 break
             await page.wait_for_timeout(1000)
 
+        # ---- 4. Handle signup wizard if still needed ----
         if "/signup/pick-handle" in page.url:
-            print(f"[*] Detected incomplete signup at {page.url}")
+            print(f"[*] Incomplete signup detected at {page.url}")
             if not await complete_incomplete_signup(page):
                 print("[!] Failed to complete signup wizard")
-                return False, address
+                return False
             if "/feed" not in page.url:
-                print(f"[!] Wizard completed but not on /feed: {page.url}")
-                return False, address
-            print("[+] Wizard completed - now on /feed")
+                print(f"[!] Wizard done but not on /feed: {page.url}")
+                return False
             await page.wait_for_timeout(2000)
         elif "/signup" in page.url:
             print(f"[!] Unexpected signup URL: {page.url}")
-            return False, address
+            return False
         elif "/feed" in page.url:
             print("[+] Login success - feed loaded")
         else:
-            print("[!] Unexpected URL:", page.url)
-            return False, address
+            print(f"[!] Unexpected URL after login: {page.url}")
+            return False
 
-        # --- Developer App Creation & Credentials (via Network) ---
+        # ---- 5. Create dev app (with retry / refresh) ----
         app_data = await create_app_and_extract_credentials(page, captured)
 
-        # --- Validate Credentials ---
         if not (app_data.get("api_key") and app_data.get("api_secret") and app_data.get("bearer_token")):
-            print("[!] Missing one or more app credentials (api_key, api_secret, bearer_token).")
-            print("[!] Skipping database update and releasing account.")
-            return False, address
+            print("[!] Missing one or more app credentials - not saving.")
+            return False
 
-        # --- Local Storage Extraction ---
-        local_db = await extract_local_storage(page)
+        # ---- 6. Save only the new app_data ----
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("audius")
+                                .update({"app_data": app_data})
+                                .eq("address", address)
+                                .execute()
+            )
+        except Exception as e:
+            print(f"[!] Supabase update failed: {e}")
+            return False
 
-        # --- Save to DB ---
-        update_payload = {
-            "app_data": app_data,
-            "local_db": local_db
-        }
-
-        supabase.table("audius").update(update_payload).eq("address", address).execute()
-        print("[+] Saved app_data and local_db to DB")
-        success = True
+        print(f"[+] Saved new app_data for {address}")
+        print(f"    api_key        : {_shorten(app_data['api_key'])}")
+        print(f"    api_secret     : {_shorten(app_data['api_secret'])}")
+        print(f"    bearer_token   : {_shorten(app_data['bearer_token'])}")
+        return True
 
     except Exception as e:
-        print("[!] Fatal:", e)
+        print(f"[!] Fatal during {address}: {e}")
+        return False
     finally:
-        if ping_task:
-            ping_task.cancel()
         try:
             await browser.close()
         except Exception:
             pass
 
-    if not success:
-        print(f"[*] Released {address} back to the pool")
-        rpc.release(address)
 
-    return success, address
-
-
+# --------------------------------------------------------------------------
+# Main loop - no MAX_RUNS cap, iterate until list is empty
+# --------------------------------------------------------------------------
 async def main() -> None:
     url, key = load_supabase_creds()
     supabase = create_client(url, key)
 
-    tried = set()
-    ok = 0
-    failed = 0
-    exhausted = False
+    # Preserve order, drop dupes
+    accounts = list(dict.fromkeys(FAILED_ADDRESSES))
+    total = len(accounts)
+    print(f"\n{'='*60}")
+    print(f"[*] {total} failed accounts to process")
+    print(f"{'='*60}")
 
-    for i in range(1, MAX_RUNS + 1):
-        print(f"\n{'='*60}\n[*] Run {i}/{MAX_RUNS}\n{'='*60}")
-        async with async_playwright() as pw:
-            success, address = await run_one(pw, supabase, tried)
+    succeeded: list[str] = []
+    failed_final: list[str] = []
+    i = 0
 
-        if address is None:
-            print("[*] No fresh eligible account left.")
-            exhausted = True
-            break
+    while accounts:
+        address = accounts.pop(0)
+        i += 1
+        remaining = len(accounts)
+        print(f"\n{'='*60}")
+        print(f"[*] [{i}/{total}] processing {address}  ({remaining} remaining after this)")
+        print(f"{'='*60}")
 
-        tried.add(address)
-        if success: ok += 1
-        else: failed += 1
-        print(f"[*] Run {i} finished")
+        # First attempt
+        ok = False
+        try:
+            async with async_playwright() as pw:
+                ok = await process_account(pw, supabase, address)
+        except Exception as e:
+            print(f"[!] Attempt 1 fatal for {address}: {e}")
 
-    print(f"\n{'='*60}\n[*] Summary: {ok} ok, {failed} failed, {len(tried)} tried\n{'='*60}")
-    if exhausted:
-        print("[*] Stopped early - pool exhausted.")
+        # One retry
+        if not ok:
+            print(f"[!] Retrying {address} once more...")
+            try:
+                async with async_playwright() as pw:
+                    ok = await process_account(pw, supabase, address)
+            except Exception as e:
+                print(f"[!] Attempt 2 fatal for {address}: {e}")
+
+        if ok:
+            succeeded.append(address)
+            print(f"[+] SUCCESS - removed from queue: {address}")
+        else:
+            failed_final.append(address)
+            print(f"[!] GAVE UP after 2 attempts: {address}")
+
+    print(f"\n{'='*60}")
+    print(f"[*] SUMMARY: {len(succeeded)} succeeded, {len(failed_final)} failed")
+    print(f"{'='*60}")
+    if succeeded:
+        print(f"[+] Succeeded ({len(succeeded)}):")
+        for a in succeeded:
+            print(f"    ✓ {a}")
+    if failed_final:
+        print(f"[!] Still failing ({len(failed_final)}):")
+        for a in failed_final:
+            print(f"    ✗ {a}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
