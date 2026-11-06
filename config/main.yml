@@ -22,81 +22,116 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Node.js setup
+      # Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      # Install Audius and Supabase
       - name: Install Node.js dependencies
+        timeout-minutes: 10
         run: |
-          npm cache clean --force
-
           npm install --no-save --prefer-online \
             @audius/sdk@latest \
             @supabase/supabase-js@latest
 
-      # Verify Node.js dependencies
       - name: Verify Node.js dependencies
         run: |
           node --version
           npm --version
-
           npm ls @audius/sdk @supabase/supabase-js
 
-      # Check for unavailable Injective dependency
-      - name: Check Injective dependency
-        continue-on-error: true
-        run: |
-          npm ls @injectivelabs/utils || true
-
-          npm view @injectivelabs/utils versions --json
-
-      # Python setup
+      # Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
 
-      # Install Python dependencies
       - name: Install Python dependencies
+        timeout-minutes: 10
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -r requirements.txt
 
-      # Chromium + OS libraries
-      - name: Install Playwright Chromium (with OS deps)
+          python --version
+          python -m playwright --version
+
+      # Playwright OS dependencies
+      - name: Install Chromium OS dependencies
+        timeout-minutes: 12
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          python -m playwright install --with-deps chromium
+          echo "Installing Chromium OS dependencies..."
+          date -u
+
+          timeout --signal=TERM --kill-after=30s 10m \
+            python -m playwright install-deps chromium
+
+          echo "OS dependencies installed."
+          date -u
+
+      # Playwright browser
+      - name: Install Playwright Chromium
+        timeout-minutes: 12
+        env:
+          PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT: "120000"
+        run: |
+          echo "Downloading Chromium..."
+          date -u
+
+          timeout --signal=TERM --kill-after=30s 10m \
+            python -m playwright install chromium
+
+          python -m playwright install --list
+
+          echo "Chromium installation completed."
+          date -u
 
       # Xvfb
       - name: Install Xvfb
+        timeout-minutes: 3
         run: |
-          sudo apt-get update
           sudo apt-get install -y xvfb
 
-      # Run login.py
+      # Audius automation
       - name: Run login.py under Xvfb
+        timeout-minutes: 340
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
-          timeout 355m xvfb-run -a \
+          echo "Starting Audius monitor..."
+          date -u
+
+          timeout --signal=TERM --kill-after=60s 335m \
+            xvfb-run -a \
             --server-args="-screen 0 1280x720x24" \
-            python3 -u src/login.py || true
-            
+            python3 -u src/login.py
+
+          echo "Audius monitor finished."
+          date -u
+
+      # Next run
       - name: Trigger the next run
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPOSITORY: ${{ github.repository }}
         run: |
+          echo "Triggering next run..."
+
           curl --fail-with-body --silent --show-error \
+            --retry 3 \
+            --retry-delay 5 \
             -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${GH_REPOSITORY}/dispatches" \
             -d '{"event_type":"run-sporty"}'
+
+          echo "Next run triggered."
