@@ -7,7 +7,6 @@ import asyncio
 import random
 import re
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
 
 from playwright.async_api import async_playwright
 from supabase import create_client
@@ -24,7 +23,8 @@ NAME_FILE   = ROOT_DIR / "name.txt"
 IMG_SCRIPT  = SCRIPT_DIR / "img.py"
 TEMPMAIL_SCRIPT = SCRIPT_DIR / "tempmail.py"
 
-MAX_RUNS = 5
+MAX_RUNS = 5            # how many signup attempts per invocation
+MAX_ACCOUNTS = 500      # hard cap on total rows in the "audius" table
 
 API_PATTERN = re.compile(r"https?://api\.audius\.co/(?:v1/)?users/[^/]+/(?:coins|connected_wallets)")
 STEP_SETTLE_MS = 3_000
@@ -57,17 +57,13 @@ IMAGE_CLICK_SELECTORS = [
     'button[aria-label="Upload a profile photo"]', 'label:has(img)',
 ]
 
-# Fallback desktop UAs (Chrome, Firefox, Edge) in case user_agents.txt is empty/missing
 DESKTOP_FALLBACK_UAS = [
-    # Chrome
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    # Firefox
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:132.0) Gecko/20100101 Firefox/132.0",
     "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
-    # Edge
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
@@ -82,25 +78,31 @@ def load_supabase_creds() -> tuple[str, str]:
     return m_url.group(1), m_key.group(1)
 
 
+def count_accounts(supabase) -> int | None:
+    """Exact row count of 'audius' table, or None on failure."""
+    try:
+        res = supabase.table("audius").select("address", count="exact").execute()
+        return res.count or 0
+    except Exception as e:
+        print(f"[!] Could not count accounts: {e}")
+        return None
+
+
 def read_user_agent() -> str:
     uas = []
     if UA_FILE.exists():
         uas = [u.strip() for u in UA_FILE.read_text().splitlines() if u.strip()]
 
-    # Filter: must be Chrome/Firefox/Edge, AND must NOT be mobile
     allowed = []
     for ua in uas:
         ua_lower = ua.lower()
-        # Exclude mobile
         if any(mob in ua_lower for mob in ("android", "mobile", "iphone", "ipad", "ipod")):
             continue
-        # Include only Chrome, Firefox, Edge
         if any(browser in ua_lower for browser in ("chrome", "firefox", "edg")):
             allowed.append(ua)
 
     if not allowed:
         return random.choice(DESKTOP_FALLBACK_UAS)
-
     return random.choice(allowed)
 
 
@@ -133,7 +135,8 @@ async def wait_with_progress(page, total_ms: int, label: str) -> None:
         return
     for i in range(1, steps + 1):
         await page.wait_for_timeout(1000)
-        if i % 5 == 0 or i == steps: print(f"    [{i}/{steps}] {page.url}")
+        if i % 5 == 0 or i == steps:
+            print(f"    [{i}/{steps}] {page.url}")
 
 
 async def wait_for_redirect(page, from_url: str, max_seconds: int = 20) -> bool:
@@ -207,43 +210,29 @@ async def upload_profile_image(page, image_path: str) -> None:
 
 
 def build_request_handler(captured: dict):
+    """Capture only the user_id from Audius users API calls."""
     def handler(request):
-        if not API_PATTERN.search(request.url): 
+        if not API_PATTERN.search(request.url):
             return
-            
-        # Extract user_id from URL (e.g., /v1/users/NzZa3b4/coins)
-        if "user_id" not in captured:
-            m = re.search(r"/users/([^/?]+)", request.url)
-            if m:
-                captured["user_id"] = m.group(1)
-
-        if captured.get("api_key"): 
+        if "user_id" in captured:
             return
-
-        qs = parse_qs(urlparse(request.url).query)
-        api_key = qs.get("api_key", [None])[0]
-        hdrs = {k.lower(): v for k, v in request.headers.items()}
-        enc_dm, enc_ds = hdrs.get("encoded-data-message"), hdrs.get("encoded-data-signature")
-        
-        if api_key and enc_dm and enc_ds:
-            captured.update({
-                "api_key": api_key, 
-                "encoded_dm": enc_dm, 
-                "encoded_ds": enc_ds
-            })
-            print("  captured wallet API credentials")
-            print(f"    user_id          : {captured.get('user_id', 'Unknown')}")
+        m = re.search(r"/users/([^/?]+)", request.url)
+        if m:
+            captured["user_id"] = m.group(1)
+            print(f"  captured user_id: {captured['user_id']}")
     return handler
 
 
-async def capture_wallet_apis(page, captured: dict) -> bool:
+async def capture_user_id(page, captured: dict) -> bool:
+    """Visits /wallet (which fires users/{id}/coins + connected_wallets) and waits for user_id."""
     for attempt in (1, 2):
         if attempt == 1:
             await page.goto("https://audius.co/wallet", wait_until="domcontentloaded", timeout=60_000)
         else:
             await page.reload(wait_until="domcontentloaded", timeout=60_000)
         for _ in range(30):
-            if captured.get("api_key"): return True
+            if captured.get("user_id"):
+                return True
             await page.wait_for_timeout(500)
     return False
 
@@ -301,17 +290,16 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
 
     step_header(1, TOTAL, "Resolve account + handle + image")
 
-    # 1. Ask rpc.py for an account
     account = rpc.claim("signup")
     while account and account["address"] in tried:
         rpc.release(account["address"])
         account = rpc.claim("signup")
-        
+
     if account is None:
         print("  creating new tempmail account ...")
         await run_py(TEMPMAIL_SCRIPT, "new")  # inserts into DB
         account = rpc.claim("signup")
-        
+
     if account is None:
         print("[!] No account available.")
         return False, None
@@ -326,7 +314,8 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
     try:
         img_out = (await run_py(IMG_SCRIPT)).strip()
         m = re.search(r"Image saved as:\s*(.+)", img_out)
-        if not m: raise RuntimeError(f"Image path not found in output: {img_out!r}")
+        if not m:
+            raise RuntimeError(f"Image path not found in output: {img_out!r}")
         image_path = m.group(1).strip()
     except Exception as e:
         print(f"[!] {e}")
@@ -336,7 +325,9 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
 
     browser = await pw.chromium.launch(
         headless=False,
-        args=["--disable-blink-features=AutomationControlled", "--disable-features=IsolateOrigins,site-per-process", "--no-sandbox", "--disable-dev-shm-usage"],
+        args=["--disable-blink-features=AutomationControlled",
+              "--disable-features=IsolateOrigins,site-per-process",
+              "--no-sandbox", "--disable-dev-shm-usage"],
     )
     context = None
     page = None
@@ -358,12 +349,11 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         await page.route("**/*", handle_route)
         page.on("request", build_request_handler(captured))
 
-        # 2. Start heartbeat for this specific account
         ping_task = asyncio.create_task(heartbeat_loop(supabase, email))
 
         # --- Wizard flow ---
         step_header(2, TOTAL, "Email")
-        await page.goto("https://audius.co/signup/create-email", wait_until="load", timeout=60_000)
+        await page.goto("https://audius.co/signup?ref=qring", wait_until="load", timeout=60_000)
         await fill_first_match(page, ['input[aria-label="Email"]'], email, "email")
         url_before = page.url
         await click_first_match(page, CONTINUE_SELECTORS)
@@ -404,27 +394,20 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
             else:
                 return False, email
 
-        step_header(9, TOTAL, "Wallet capture + DB update")
-        await capture_wallet_apis(page, captured)
+        step_header(9, TOTAL, "User ID capture + DB update")
+        await capture_user_id(page, captured)
 
-        # 3. Save credentials, handle, and user_id directly to the assigned row
         payload = {
             "register": "yes",
-            "handle": handle
+            "handle": handle,
         }
-        
-        if captured:
-            payload.update({
-                "api_key": captured["api_key"], 
-                "encoded_dm": captured["encoded_dm"], 
-                "encoded_ds": captured["encoded_ds"]
-            })
-            if "user_id" in captured:
-                payload["user_id"] = captured["user_id"]
-            print(f"  saved credentials and handle to DB")
+
+        if "user_id" in captured:
+            payload["user_id"] = captured["user_id"]
+            print("  saved handle and user_id to DB")
         else:
-            print(f"  saved handle to DB (no wallet credentials)")
-        
+            print("  saved handle to DB (no user_id captured)")
+
         supabase.table("audius").update(payload).eq("address", email).execute()
         print(f"  marked {email} register='yes'")
         signup_done = True
@@ -432,13 +415,11 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
     except Exception as e:
         print("[!] Fatal:", e)
     finally:
-        # 4. Stop heartbeat
         if ping_task:
             ping_task.cancel()
         if page is not None and context is not None:
             await shutdown_browser(page, context, browser)
 
-    # 5. Release back to pool
     rpc.release(email)
     if not signup_done:
         print(f"\n[!] Signup failed for {email} - released for retry")
@@ -449,15 +430,39 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
 async def main() -> None:
     url, key = load_supabase_creds()
     supabase = create_client(url, key)
-    
+
     tried = set()
     ok = 0
     failed = 0
     exhausted = False
+    max_reached = False
 
-    print("[*] Audius signup")
+    print(f"[*] Audius signup  (max runs: {MAX_RUNS}, max accounts: {MAX_ACCOUNTS})")
+
+    initial = count_accounts(supabase)
+    if initial is None:
+        print("[!] Could not read current account count.")
+    else:
+        print(f"[*] Current account count in table: {initial}/{MAX_ACCOUNTS}")
+        if initial >= MAX_ACCOUNTS:
+            print(f"\n{'='*60}")
+            print(f"[!] Maximum account creation reached ({initial}/{MAX_ACCOUNTS})")
+            print(f"{'='*60}")
+            return
+
     for i in range(1, MAX_RUNS + 1):
-        print(f"\n{'='*60}\n[*] Run {i}/{MAX_RUNS}\n{'='*60}")
+        # --- cap check before each run ---
+        current = count_accounts(supabase)
+        if current is not None and current >= MAX_ACCOUNTS:
+            print(f"\n{'='*60}")
+            print(f"[!] Maximum account creation reached ({current}/{MAX_ACCOUNTS})")
+            print(f"{'='*60}")
+            max_reached = True
+            break
+
+        count_label = f"{current}/{MAX_ACCOUNTS}" if current is not None else f"?/{MAX_ACCOUNTS}"
+        print(f"\n{'='*60}\n[*] Run {i}/{MAX_RUNS}  (accounts: {count_label})\n{'='*60}")
+
         async with async_playwright() as pw:
             success, address = await run_signup(pw, supabase, tried)
 
@@ -467,13 +472,30 @@ async def main() -> None:
             break
 
         tried.add(address)
-        if success: ok += 1
-        else: failed += 1
+        if success:
+            ok += 1
+        else:
+            failed += 1
+
+        # --- cap check after each run (row may have been added by tempmail) ---
+        current = count_accounts(supabase)
+        if current is not None and current >= MAX_ACCOUNTS:
+            print(f"\n{'='*60}")
+            print(f"[!] Maximum account creation reached ({current}/{MAX_ACCOUNTS})")
+            print(f"{'='*60}")
+            max_reached = True
+            break
+
         print(f"[*] Run {i} finished")
 
     print(f"\n{'='*60}\n[*] Summary: {ok} ok, {failed} failed, {len(tried)} tried\n{'='*60}")
-    if exhausted:
+    if max_reached:
+        print(f"[*] Stopped - maximum account creation reached ({MAX_ACCOUNTS})")
+    elif exhausted:
         print("[*] Stopped early - no account available.")
+    else:
+        print(f"[*] Stopped - reached {MAX_RUNS} runs.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
