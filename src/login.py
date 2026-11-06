@@ -465,7 +465,7 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         except Exception:
             pass
 
-        # --- OTP Retrieval with X3 Retry ---
+        # --- OTP Retrieval with X10 Retry ---
         otp = None
         for attempt in range(1, 4):
             try:
@@ -476,16 +476,16 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
                     print("[*] OTP:", otp)
                     break
                 else:
-                    print(f"[!] Attempt {attempt}/3: OTP not found in inbox.")
+                    print(f"[!] Attempt {attempt}/10: OTP not found in inbox.")
             except Exception as e:
-                print(f"[!] Attempt {attempt}/3: tempmail inbox failed: {e}")
+                print(f"[!] Attempt {attempt}/10: tempmail inbox failed: {e}")
             
-            if attempt < 3:
+            if attempt < 10:
                 print("    -> waiting 5s for email to arrive...")
                 await page.wait_for_timeout(5000)
                 
         if not otp:
-            print("[!] Failed to retrieve OTP after 3 attempts.")
+            print("[!] Failed to retrieve OTP after 10 attempts.")
             return False, address
 
         await page.fill('input[aria-label="Code"]', otp)
