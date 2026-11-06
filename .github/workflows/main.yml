@@ -85,8 +85,13 @@ jobs:
         run: |
           timeout 355m xvfb-run -a \
             --server-args="-screen 0 1280x720x24" \
+<<<<<<< HEAD
             python3 -u src/login.py || true
             
+=======
+            python3 -u src/signup.py || true
+
+>>>>>>> 354917c (Update main.yml)
       - name: Trigger the next run
         if: always()
         env:
