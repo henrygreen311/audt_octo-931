@@ -97,7 +97,70 @@ async function uploadImage(sdk, { width, height, isBackdrop, name }) {
 const uploadPhoto = sdk => uploadImage(sdk, { width: 600, height: 600, isBackdrop: false, name: 'profile.jpg' });
 const uploadCover = sdk => uploadImage(sdk, { width: 800, height: 600, isBackdrop: true, name: 'cover.jpg' });
 
-// Checks the live profile first, then fills in only what's missing.
+const MAX_RETRIES = 3;
+const RETRY_DELAYS_MS = [3000, 8000, 15000];
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Short, readable error text (includes the HTTP status when the API gave one).
+async function describeError(err) {
+  let msg = String((err && err.message) || err).replace(/\s+/g, ' ');
+  const res = err && err.response;
+  if (res && res.status) {
+    let detail = '';
+    try {
+      detail = (await res.clone().text()).replace(/\s+/g, ' ').slice(0, 80);
+    } catch (_) {}
+    msg = `HTTP ${res.status}${detail ? ` ${detail}` : ''}`;
+  }
+  return msg.slice(0, 120);
+}
+
+// One attempt: checks the live profile first, then fills in only what's missing.
+// Throws on errors so the caller can retry; returns a status string otherwise.
+async function attemptAccount(account, tag) {
+  const { user_id: userId, app_data: appData } = account;
+
+  const sdk = sdkFactory({
+    apiKey: appData.api_key,
+    apiSecret: appData.api_secret,
+    bearerToken: appData.bearer_token,
+  });
+
+  // 1. Request the current profile (fresh on every attempt, so a retry never
+  //    re-adds something that a previous attempt already saved)
+  const user = (await sdk.users.getUser({ id: userId })).data;
+  if (!user) {
+    log(`${tag}  failed: user not found`);
+    return 'failed';
+  }
+
+  const missing = {
+    bio: !hasBio(user),
+    photo: !hasPhoto(user),
+    cover: !hasCover(user),
+  };
+  const have = Object.keys(missing).filter(k => !missing[k]);
+  const need = Object.keys(missing).filter(k => missing[k]);
+
+  // 2. Everything exists -> skip
+  if (need.length === 0) {
+    log(`${tag}  skipped (has bio + photo + cover)`);
+    return 'skipped';
+  }
+
+  // 3. Only generate/upload what is missing
+  const metadata = {};
+  if (missing.bio) metadata.bio = generateBio();
+  if (missing.photo) metadata.profilePicture = await uploadPhoto(sdk);
+  if (missing.cover) metadata.coverPhoto = await uploadCover(sdk);
+
+  await sdk.users.updateUser({ id: userId, userId, metadata });
+
+  log(`${tag}  added ${need.join(' + ')}${have.length ? ` (already had ${have.join(' + ')})` : ''}`);
+  return 'updated';
+}
+
+// Runs an account, retrying up to MAX_RETRIES times if a request fails.
 async function processAccount(account, label) {
   const { address, user_id: userId, app_data: appData } = account;
   const tag = `${label} ${address}`;
@@ -107,48 +170,18 @@ async function processAccount(account, label) {
     return 'nocreds';
   }
 
-  try {
-    const sdk = sdkFactory({
-      apiKey: appData.api_key,
-      apiSecret: appData.api_secret,
-      bearerToken: appData.bearer_token,
-    });
-
-    // 1. Request the current profile
-    const user = (await sdk.users.getUser({ id: userId })).data;
-    if (!user) {
-      log(`${tag}  failed: user not found`);
-      return 'failed';
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await attemptAccount(account, tag);
+    } catch (err) {
+      const reason = await describeError(err);
+      if (attempt >= MAX_RETRIES) {
+        log(`${tag}  failed after ${MAX_RETRIES} retries: ${reason}`);
+        return 'failed';
+      }
+      log(`${tag}  retry ${attempt + 1}/${MAX_RETRIES} (${reason})`);
+      await sleep(RETRY_DELAYS_MS[attempt]);
     }
-
-    const missing = {
-      bio: !hasBio(user),
-      photo: !hasPhoto(user),
-      cover: !hasCover(user),
-    };
-    const have = Object.keys(missing).filter(k => !missing[k]);
-    const need = Object.keys(missing).filter(k => missing[k]);
-
-    // 2. Everything exists -> skip
-    if (need.length === 0) {
-      log(`${tag}  skipped (has bio + photo + cover)`);
-      return 'skipped';
-    }
-
-    // 3. Only generate/upload what is missing
-    const metadata = {};
-    if (missing.bio) metadata.bio = generateBio();
-    if (missing.photo) metadata.profilePicture = await uploadPhoto(sdk);
-    if (missing.cover) metadata.coverPhoto = await uploadCover(sdk);
-
-    await sdk.users.updateUser({ id: userId, userId, metadata });
-
-    log(`${tag}  added ${need.join(' + ')}${have.length ? ` (already had ${have.join(' + ')})` : ''}`);
-    return 'updated';
-  } catch (err) {
-    const msg = String(err && err.message ? err.message : err).replace(/\s+/g, ' ').slice(0, 120);
-    log(`${tag}  failed: ${msg}`);
-    return 'failed';
   }
 }
 
