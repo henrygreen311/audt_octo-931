@@ -24,17 +24,6 @@ IMG_SCRIPT      = SCRIPT_DIR / "img.py"
 # Accounts to re-run (previously failed because app wasn't authorized)
 # ============================================================
 FAILED_ADDRESSES = [
-    "c40079ee@tiffincrane.com",
-    "2c1f4399@tiffincrane.com",
-    "bbf799e1@tiffincrane.com",
-    "aace2710@tiffincrane.com",
-    "3c5eabe9@tiffincrane.com",
-    "52ed0cdf@tiffincrane.com",
-    "8ad232dd@tiffincrane.com",
-    "cdeaf82d@tiffincrane.com",
-    "716f1879@tiffincrane.com",
-    "580dadf6@tiffincrane.com",
-    "c50cbbf4@tiffincrane.com",
     "478ae935@tiffincrane.com",
     "096226c5@tiffincrane.com",
     "87e59529@tiffincrane.com",
