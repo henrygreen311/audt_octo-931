@@ -1,18 +1,6 @@
 #!/usr/bin/env node
 'use strict';
 
-/*
- * Required one-time SQL migration (run in Supabase SQL editor):
- *
- *   ALTER TABLE public.audius
- *   ADD COLUMN IF NOT EXISTS favorite JSONB NOT NULL DEFAULT '{"week_start": null, "runs": []}'::jsonb;
- *
- * Per-account "favorite" column:
- *   { week_start, v, runs: [ { date, day, run_number, tracks: [ { track_id, status: 'success', favorited_at } ] } ] }
- * Coordinator row (TARGET_ADDRESS) additionally carries { batches: [...], lock: {...} } in its own "favorite" column.
- * up_tracks and follower columns are never written by this script.
- */
-
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
