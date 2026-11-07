@@ -68,6 +68,9 @@ const CFG = {
   ratePauseMs: Number(process.env.RATE_PAUSE_MS || 15000), // pause after each 429
   rateStopAfter: Number(process.env.RATE_STOP_AFTER || 10), // this many 429s in a row => stop, resume next run
   followDelayMs: Number(process.env.FOLLOW_DELAY_MS || 300),
+  callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000, // hard limit per SDK call
+  maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000, // 0 = no limit; else stop cleanly, next run resumes
+  progressEvery: Number(process.env.PROGRESS_EVERY || 5), // log a progress line every N follow jobs
   scanPages: Number(process.env.FOLLOWING_SCAN_PAGES || 10), // fallback check: pages of 100 followings
 };
 
@@ -122,7 +125,13 @@ async function withRetry(fn, retryIf = isTransient, tries = CFG.retries) {
   }
   throw lastErr;
 }
-const readRetry = fn => withRetry(fn, e => !isRateLimit(e) && isTransient(e)); // 429 is never retried
+// A hung network call must never freeze the run: every SDK call gets a hard timeout.
+function withTimeout(promise, ms = CFG.callTimeoutMs, what = 'request') {
+  let t;
+  const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`timeout: ${what} took longer than ${ms / 1000}s`)), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+const readRetry = fn => withRetry(() => withTimeout(fn()), e => !isRateLimit(e) && isTransient(e)); // 429 is never retried
 
 // ---------------------------------------------------------------------------
 // Date / week helpers (identical logic to upload_track.js: Saturday-based week)
@@ -452,10 +461,20 @@ const FOLLOW_STYLES = [
   (f, t) => ({ id: f, userId: f, followeeUserId: t }), // id = the user doing the following
 ];
 
+const label0 = a => a.handle || a.address;
+
 async function followJob(sb, ctx, run, acct, target) {
   const st = run.stats;
   if (run.abort || LOCK_LOST) return;
+  if (!run.stop && CFG.maxRunMs && Date.now() - run.startedAt > CFG.maxRunMs) {
+    run.stop = true;
+    log('[!] Time budget reached; stopping this run cleanly. The next execution resumes it.');
+  }
   if (run.stop || run.cool.has(acct.address)) { st.retry++; return; } // left for the next run
+  run.jobs = (run.jobs || 0) + 1;
+  if (CFG.progressEvery && run.jobs % CFG.progressEvery === 1) {
+    log(`[~] job ${run.jobs}/${run.total} (${Math.round((Date.now() - run.startedAt) / 1000)}s): ${label0(acct)} -> ${target.handle}`);
+  }
   const label = acct.handle || acct.address;
   let verified = false;
   try {
@@ -468,7 +487,7 @@ async function followJob(sb, ctx, run, acct, target) {
       let lastErr = null;
       for (const i of run.style === null ? [0, 1] : [run.style]) {
         lastErr = null;
-        try { await sdk.users.followUser(FOLLOW_STYLES[i](acct.user_id, target.id)); } catch (e) {
+        try { await withTimeout(sdk.users.followUser(FOLLOW_STYLES[i](acct.user_id, target.id)), CFG.callTimeoutMs, 'followUser'); } catch (e) {
           if (isRateLimit(e)) throw e;
           lastErr = e; // may still have landed: verify below
           if (!statusOf(e) && /required parameter|invalid/i.test(String(e.message))) continue; // rejected before sending
@@ -548,7 +567,7 @@ async function processRun(sb, ctx, rows, published, coord, { runNumber, batch })
     });
   }
 
-  const run = { number: runNumber, cool: new Set(), abort: null, stop: false, style: null, consecRate: 0, sdks: new Map(), stats: { ok: 0, already: 0, rate: 0, retry: 0, perm: 0, logged: 0 } };
+  const run = { startedAt: Date.now(), jobs: 0, total: targets.reduce((n, t) => n + members.filter(a => !a.followed.has(t.key)).length, 0), number: runNumber, cool: new Set(), abort: null, stop: false, style: null, consecRate: 0, sdks: new Map(), stats: { ok: 0, already: 0, rate: 0, retry: 0, perm: 0, logged: 0 } };
   const st = run.stats;
 
   // One handle at a time: every selected account follows handle #1, then handle #2, ... (spreads the load).
