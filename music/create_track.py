@@ -24,7 +24,7 @@ GEMINI_KEY_URL = "https://gemini-api.qring99.workers.dev/"
 # ===============================================================
 # SETTING: Max tracks to generate per run (Max 20)
 # ===============================================================
-MAX_TRACKS = int(os.getenv("MAX_TRACKS", "1"))
+MAX_TRACKS = int(os.getenv("MAX_TRACKS", "20"))
 if MAX_TRACKS < 1: MAX_TRACKS = 1
 if MAX_TRACKS > 20: MAX_TRACKS = 20
 
