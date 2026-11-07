@@ -60,6 +60,7 @@ const CFG = {
   runsPerDay: 2,
   concurrency: 5, // hard cap on simultaneous follow jobs
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
+  lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000, // no heartbeat for this long => owner is dead
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
   retryBaseMs: Number(process.env.RETRY_BASE_MS || 2000),
   verifyTries: 4,
@@ -309,8 +310,12 @@ async function flushPending(sb, ctx) {
 // ---------------------------------------------------------------------------
 // Batch lock (stored in the coordinator's follower document)
 // ---------------------------------------------------------------------------
+// A live run refreshes lock.beat every few seconds (heartbeat). A cancelled/killed run stops
+// beating, so its lock goes stale after lockStaleMs - no matter which machine or container it ran on.
 function lockStaleReason(lock) {
   if (!(Date.parse(lock.expires_at) > Date.now())) return 'it expired';
+  const beat = Date.parse(lock.beat || lock.acquired_at);
+  if (!Number.isFinite(beat) || Date.now() - beat > CFG.lockStaleMs) return 'its owner stopped responding (cancelled run)';
   if (lock.pid && lock.host === os.hostname()) {
     try { process.kill(lock.pid, 0); } catch (e) { if (e.code !== 'EPERM') return 'its owner process is no longer running'; }
   }
@@ -328,8 +333,8 @@ async function acquireLock(sb, ctx) {
       log(`[~] Taking over batch lock from ${h.lock.acquired_at}: ${why}.`);
     }
     h.lock = {
-      token, acquired_at: new Date().toISOString(), expires_at: new Date(Date.now() + CFG.lockTtlMs).toISOString(),
-      pid: process.pid, host: os.hostname(),
+      token, acquired_at: new Date().toISOString(), beat: new Date().toISOString(),
+      expires_at: new Date(Date.now() + CFG.lockTtlMs).toISOString(), pid: process.pid, host: os.hostname(),
     };
     return true;
   });
@@ -337,10 +342,25 @@ async function acquireLock(sb, ctx) {
   return { token };
 }
 
-const renewLock = (sb, ctx) => updateFollower(sb, TARGET_ADDRESS, ctx.weekStart, h => {
-  h.lock.expires_at = new Date(Date.now() + CFG.lockTtlMs).toISOString();
-  return true;
-});
+let LOCK_LOST = null; // set by the heartbeat if another run took the lock over
+
+// Refreshes lock.beat while this run is alive (the event loop is never blocked here).
+function startHeartbeat(sb, ctx) {
+  let busy = false;
+  const timer = setInterval(async () => {
+    if (busy || LOCK_LOST) return;
+    busy = true;
+    try {
+      await updateFollower(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+        h.lock.beat = new Date().toISOString();
+        h.lock.expires_at = new Date(Date.now() + CFG.lockTtlMs).toISOString();
+        return true;
+      });
+    } catch (e) { if (e instanceof LockLostError) LOCK_LOST = e; } finally { busy = false; }
+  }, Math.max(5000, CFG.lockStaleMs / 4));
+  timer.unref();
+  return () => clearInterval(timer);
+}
 
 async function releaseLock(sb, ctx, lock) {
   if (!lock) return;
@@ -437,7 +457,7 @@ function dayState(coord, today) {
 // ---------------------------------------------------------------------------
 async function followJob(sb, ctx, run, acct, target) {
   const st = run.stats;
-  if (run.abort) return;
+  if (run.abort || LOCK_LOST) return;
   if (run.cool.has(acct.address)) { st.retry++; return; } // rate-limited earlier: leave for the next run
   const label = acct.handle || acct.address;
   let verified = false;
@@ -523,10 +543,9 @@ async function processRun(sb, ctx, rows, published, coord, { runNumber, batch })
   for (const t of targets) {
     const todo = members.filter(a => !a.followed.has(t.key));
     if (!todo.length) continue;
-    await renewLock(sb, ctx);
     const before = st.ok + st.already;
     await runPool(todo, CFG.concurrency, a => followJob(sb, ctx, run, a, t));
-    if (run.abort) throw run.abort;
+    if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     log(`[*] @${t.handle}: ${st.ok + st.already - before}/${todo.length} followed.`);
   }
 
@@ -574,6 +593,8 @@ async function runFollower({ now = new Date() } = {}) {
   const lock = await acquireLock(sb, ctx);
   if (!lock) return { status: 'LOCKED' };
   HELD_LOCK = lock;
+  LOCK_LOST = null;
+  const stopHeartbeat = startHeartbeat(sb, ctx);
 
   try {
     await flushPending(sb, ctx);
@@ -586,6 +607,7 @@ async function runFollower({ now = new Date() } = {}) {
     }
     return await processRun(sb, ctx, rows, published, coord, state);
   } finally {
+    stopHeartbeat();
     HELD_LOCK = null;
     await releaseLock(sb, ctx, lock);
   }
