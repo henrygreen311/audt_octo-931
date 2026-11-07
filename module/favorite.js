@@ -105,8 +105,8 @@ const TARGET_ADDRESS = 'qringgreen@gmail.com';
 
 const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
-  accountsPerRun: 50,
   dailyPerTrack: Number(process.env.DAILY_FAVORITES_PER_TRACK || 100),
+  dailyPerPreviousTrack: Number(process.env.DAILY_FAVORITES_PER_PREVIOUS_TRACK || 10),
   runsPerDay: 2,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
@@ -120,6 +120,9 @@ const CFG = {
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 20) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
 };
+
+// Accounts tried per run for a track whose daily cap is `cap` (50 for 100/day, 5 for 10/day).
+const attemptsPerRun = cap => Math.ceil(cap / CFG.runsPerDay);
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 
@@ -235,16 +238,24 @@ async function readUpTracks(sb) {
 }
 
 // up_tracks = { week_start, days: [ { date, address, handle, track_id, status, ... } ] }
-function todaysTracks(upTracks, today) {
+// Returns today's successful tracks first (cap 100/day), then earlier successful tracks of the
+// stored week, newest first (cap 10/day).
+function collectTracks(upTracks, today) {
   const days = isObj(upTracks) && Array.isArray(upTracks.days) ? upTracks.days : [];
   const seen = new Map();
   for (const d of days) {
-    if (!d || d.date !== today || d.status !== 'success' || d.track_id == null) continue;
+    if (!d || d.status !== 'success' || d.track_id == null || typeof d.date !== 'string' || d.date > today) continue;
     const id = String(d.track_id).trim();
-    if (!TRACK_ID_RE.test(id) || seen.has(id)) continue;
-    seen.set(id, { id, key: id, address: d.address || null, handle: typeof d.handle === 'string' ? d.handle : null });
+    if (!TRACK_ID_RE.test(id)) continue;
+    const isToday = d.date === today;
+    const prev = seen.get(id);
+    if (prev && !(isToday && prev.previous)) continue;
+    seen.set(id, {
+      id, key: id, address: d.address || null, handle: typeof d.handle === 'string' ? d.handle : null,
+      date: d.date, previous: !isToday, cap: isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack,
+    });
   }
-  return [...seen.values()];
+  return [...seen.values()].sort((x, y) => (x.previous - y.previous) || (x.date < y.date ? 1 : x.date > y.date ? -1 : 0));
 }
 
 function normalizeFavorite(raw, weekStart) {
@@ -426,11 +437,11 @@ async function verifyFavorite(sdk, userId, trackId) {
 
 function tracksBelowCap(rows, published, ctx) {
   const today = countTracks(rows, ctx);
-  return published.filter(p => (today.get(p.key) || 0) < CFG.dailyPerTrack);
+  return published.filter(p => (today.get(p.key) || 0) < p.cap);
 }
 
 function allDoneMsg(n) {
-  return `[*] All ${n} tracks reached ${CFG.dailyPerTrack} favorites today. Exiting.`;
+  return `[*] All ${n} tracks reached their daily favorite limit. Exiting.`;
 }
 
 function dayState(coord, today) {
@@ -509,11 +520,12 @@ async function favoriteJob(sb, ctx, run, acct, target) {
   return outcome;
 }
 
-async function fillTrack(sb, ctx, run, target, need, candidates) {
+// Tries up to `attempts` accounts (rate-limited/failed ones count as attempts and are not replaced),
+// stopping early once `maxOk` successes are reached.
+async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let got = 0;
   let inflight = 0;
-  let transient = 0;
-  let skipped = 0;
+  let started = 0;
   const step = async () => {
     if (run.abort || LOCK_LOST || run.stop) return false;
     if (CFG.maxRunMs && Date.now() - run.startedAt > CFG.maxRunMs) {
@@ -521,8 +533,8 @@ async function fillTrack(sb, ctx, run, target, need, candidates) {
       log('[!] Time limit reached; stopping. Next run resumes.');
       return false;
     }
-    if (got >= need) return false;
-    if (got + inflight >= need) {
+    if (got >= maxOk || started >= attempts) return false;
+    if (got + inflight >= maxOk) {
       if (!inflight) return false;
       await sleep(50);
       return true;
@@ -530,15 +542,14 @@ async function fillTrack(sb, ctx, run, target, need, candidates) {
     const acct = candidates.shift();
     if (!acct) return false;
     inflight++;
+    started++;
     const outcome = await favoriteJob(sb, ctx, run, acct, target);
     inflight--;
     if (outcome === 'ok' || outcome === 'already') got++;
-    else skipped++;
-    if (outcome === 'rate' || outcome === 'retry') transient++;
     return true;
   };
   await Promise.all(Array.from({ length: Math.max(1, CFG.concurrency) }, async () => { while (await step()); }));
-  return { got, transient, skipped };
+  return { got, started, skipped: started - got };
 }
 
 function countToday(raw, ctx) {
@@ -586,21 +597,38 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
 
   const todayDone = countTracks(rows, ctx);
   const runDone = countTracks(rows, ctx, runNumber);
-  const lastRun = runNumber >= CFG.runsPerDay;
   const need = new Map(targets.map(t => {
-    const left = Math.max(0, CFG.dailyPerTrack - (todayDone.get(t.key) || 0));
-    const perRun = lastRun ? left : Math.min(left, Math.max(0, CFG.accountsPerRun - (runDone.get(t.key) || 0)));
-    return [t.key, perRun];
+    const left = Math.max(0, t.cap - (todayDone.get(t.key) || 0));
+    const attempts = Math.max(0, attemptsPerRun(t.cap) - (runDone.get(t.key) || 0));
+    return [t.key, { attempts: left ? attempts : 0, maxOk: left }];
   }));
   let totalNeed = 0;
   let active = 0;
-  for (const n of need.values()) { totalNeed += n; if (n) active++; }
-  if (!totalNeed) {
-    log(allDoneMsg(targets.length));
-    return { status: 'ALREADY_COMPLETED' };
+  let activePrev = 0;
+  for (const t of targets) {
+    const n = need.get(t.key);
+    if (!n.attempts) continue;
+    totalNeed += Math.min(n.attempts, n.maxOk);
+    active++;
+    if (t.previous) activePrev++;
   }
-  const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= CFG.dailyPerTrack).length;
-  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do${atCap ? ` (${atCap} already at ${CFG.dailyPerTrack})` : ''}, ${totalNeed} favorites.`);
+  if (!totalNeed) {
+    if (!tracksBelowCap(rows, targets, ctx).length) {
+      log(allDoneMsg(targets.length));
+      return { status: 'ALREADY_COMPLETED' };
+    }
+    await updateFavorite(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+      if (!h.batches) h.batches = [];
+      const b = h.batches.find(x => x.date === ctx.today && x.run_number === runNumber);
+      if (b && b.done) return false;
+      if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: runNumber, done: true });
+      return true;
+    });
+    log(`[*] Run ${runNumber}: nothing left to attempt in this run.`);
+    return { status: 'COMPLETED' };
+  }
+  const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
+  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do (${active - activePrev} today, ${activePrev} previous days)${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} favorites.`);
 
   if (!batch) {
     await updateFavorite(sb, TARGET_ADDRESS, ctx.weekStart, h => {
@@ -616,20 +644,21 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   let incomplete = false;
 
   for (const t of targets) {
-    const want = need.get(t.key);
-    if (!want) continue;
+    const n = need.get(t.key);
+    if (!n.attempts) continue;
     if (run.stop) { incomplete = true; continue; }
     const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !a.favorited.has(t.key) && !run.cool.has(a.address));
     const candidates = shuffle(pool).sort((x, y) => x.today - y.today);
-    const { got, transient, skipped } = await fillTrack(sb, ctx, run, t, want, candidates);
+    const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     const day = (todayDone.get(t.key) || 0) + got;
-    if (got < want) {
-      if (transient || run.stop) incomplete = true;
-      log(`[!] track ${t.id} | ${day}/${CFG.dailyPerTrack} today${transient || run.stop ? '' : ' (no more accounts available)'}`);
+    const tag = t.previous ? ' [previous day]' : '';
+    if (started < n.attempts && got < n.maxOk && !run.stop) {
+      log(`[!] track ${t.id}${tag} | ${day}/${t.cap} today (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
     } else {
-      log(`[*] track ${t.id} | ${day}/${CFG.dailyPerTrack} today${day >= CFG.dailyPerTrack ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
+      log(`[*] track ${t.id}${tag} | ${day}/${t.cap} today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
     }
+    if (run.stop) incomplete = true;
   }
 
   const left = incomplete;
@@ -655,11 +684,12 @@ async function runFavorite({ now = new Date() } = {}) {
   const sb = connectSupabase();
   PENDING = loadPending();
 
-  const published = todaysTracks(await readUpTracks(sb), ctx.today);
+  const published = collectTracks(await readUpTracks(sb), ctx.today);
   if (!published.length) {
-    log('[!] No tracks published today. Exiting.');
+    log('[!] No successful tracks found. Exiting.');
     return { status: 'NO_TARGETS' };
   }
+  if (!published.some(t => !t.previous)) log('[*] No tracks published today; using previous days only.');
 
   let rows = await fetchRows(sb);
   const coordRaw = rows.find(r => r.address === TARGET_ADDRESS).favorite;
@@ -709,4 +739,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runFavorite, todaysTracks, buildContext, CFG };
+module.exports = { runFavorite, collectTracks, buildContext, CFG };
