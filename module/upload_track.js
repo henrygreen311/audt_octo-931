@@ -46,6 +46,10 @@ const IMAGES_DIR = path.join(MUSIC_DIR, 'images');
 // Local crash-recovery journal (not a database object).
 const STATE_FILE = path.join(ROOT_DIR, '.audius_daily_state.json');
 
+// All publishing history (and the batch lock) lives ONLY in this row's up_tracks column,
+// the same row music/login.py writes ms_cookie to. No other account row is ever written.
+const TARGET_ADDRESS = 'qringgreen@gmail.com';
+
 const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
   accountsPerDay: 20,
@@ -300,11 +304,12 @@ function buildContext(now) {
 }
 
 // ---------------------------------------------------------------------------
-// up_tracks history helpers
-//   { week_start, days: [ {date, day, handle, track_id, original_title,
+// up_tracks history (stored once, on the TARGET_ADDRESS row only)
+//   { week_start, days: [ {date, day, address, handle, track_id, original_title,
 //                          published_title, generated_track, status, ...} ] }
+//   One flat list for all accounts; each entry carries the account's "address".
 //   status: reserved -> publishing -> success | failed   (only "success" counts)
-//   The coordinator row additionally carries a temporary "lock" key.
+//   The same object additionally carries a temporary "lock" key.
 // ---------------------------------------------------------------------------
 const isCurrentWeek = (raw, weekStart) => isObj(raw) && raw.week_start === weekStart && Array.isArray(raw.days);
 
@@ -317,7 +322,7 @@ function normalizeHistory(raw, weekStart) {
 
 function cleanEntry(e) {
   const out = {
-    date: e.date, day: e.day, handle: e.handle == null ? null : e.handle,
+    address: e.address, date: e.date, day: e.day, handle: e.handle == null ? null : e.handle,
     track_id: e.track_id == null ? null : e.track_id,
     original_title: e.original_title, published_title: e.published_title,
     generated_track: e.generated_track, status: e.status,
@@ -362,33 +367,47 @@ async function readRow(sb, address) {
   return data && data[0];
 }
 
-// Read-modify-write of one account's history. Only the lock holder writes, so no clobbering.
-async function updateHistory(sb, address, weekStart, mutate) {
-  return withRetry(`db update ${address}`, async () => {
-    const row = await readRow(sb, address);
-    if (!row) throw new Error(`account row not found: ${address}`);
+// Lock currently held by this run (set in runDaily). While set, every write to the
+// history row is conditional on that lock token, so a run whose lock was taken over
+// can never overwrite the new owner's data.
+let HELD_LOCK = null;
+
+// Read-modify-write of the single history row (TARGET_ADDRESS).
+async function updateHistory(sb, weekStart, mutate) {
+  return withRetry(`db update ${TARGET_ADDRESS}`, async () => {
+    const row = await readRow(sb, TARGET_ADDRESS);
+    if (!row) throw new Error(`history row not found: ${TARGET_ADDRESS}`);
     const hist = normalizeHistory(row.up_tracks, weekStart);
+    if (HELD_LOCK && !(hist.lock && hist.lock.token === HELD_LOCK.token)) {
+      throw new LockLostError('batch lock was taken over by another run');
+    }
     if (mutate(hist) === false) return hist;
-    const { data, error } = await sb.from('audius').update({ up_tracks: hist }).eq('address', address).select('address, up_tracks');
+    let q = sb.from('audius').update({ up_tracks: hist }).eq('address', TARGET_ADDRESS);
+    if (HELD_LOCK) q = q.eq('up_tracks->lock->>token', HELD_LOCK.token);
+    const { data, error } = await q.select('address, up_tracks');
     if (error) throw new Error(error.message);
-    if (!data || data.length !== 1) throw new Error(`update affected ${data ? data.length : 0} rows`);
+    if (!data || data.length !== 1) {
+      if (HELD_LOCK) throw new LockLostError('batch lock was taken over by another run');
+      throw new Error(`update affected ${data ? data.length : 0} rows`);
+    }
     return normalizeHistory(data[0].up_tracks, weekStart); // value as stored by the database
-  }, { retryIf: anyErr });
+  }, { retryIf: e => !(e instanceof LockLostError) });
 }
 
 // Insert/update today's record for an account and verify what the database stored.
 async function upsertEntry(sb, ctx, address, patch) {
-  const stored = await updateHistory(sb, address, ctx.weekStart, hist => {
-    const i = hist.days.findIndex(d => d.date === patch.date);
+  const sameEntry = d => d.date === patch.date && d.address === address;
+  const stored = await updateHistory(sb, ctx.weekStart, hist => {
+    const i = hist.days.findIndex(sameEntry);
     if (i >= 0) {
       if (hist.days[i].status === 'success' && patch.status !== 'success') return false; // never downgrade
-      hist.days[i] = cleanEntry({ ...hist.days[i], ...patch });
+      hist.days[i] = cleanEntry({ ...hist.days[i], ...patch, address });
     } else {
-      hist.days.push(cleanEntry(patch));
+      hist.days.push(cleanEntry({ ...patch, address }));
     }
     return true;
   });
-  const saved = stored.days.find(d => d.date === patch.date);
+  const saved = stored.days.find(sameEntry);
   if (saved && saved.status === 'success' && patch.status !== 'success') return saved;
   if (!saved || saved.status !== patch.status || (patch.track_id !== undefined && (saved.track_id || null) !== (patch.track_id || null))) {
     throw new Error(`database verification failed for ${address} (${patch.date})`);
@@ -396,16 +415,14 @@ async function upsertEntry(sb, ctx, address, patch) {
   return saved;
 }
 
-// Saturday reset: any row whose history is not for the current week is re-initialised.
-// Rows already holding the current week are left untouched (idempotent).
+// Saturday reset: if the history row is not for the current week it is re-initialised
+// (days emptied, lock kept). A row already holding the current week is left untouched.
 async function weeklyResetPass(sb, rows, ctx) {
-  const stale = rows.filter(r => !isCurrentWeek(r.up_tracks, ctx.weekStart));
-  if (!stale.length) return 0;
-  log(`[*] Week ${ctx.weekStart}: initialising weekly history for ${stale.length} account(s)...`);
-  for (let i = 0; i < stale.length; i += 10) {
-    await Promise.all(stale.slice(i, i + 10).map(r => updateHistory(sb, r.address, ctx.weekStart, () => true)));
-  }
-  return stale.length;
+  const row = rows.find(r => r.address === TARGET_ADDRESS);
+  if (row && isCurrentWeek(row.up_tracks, ctx.weekStart)) return 0;
+  log(`[*] Week ${ctx.weekStart}: initialising weekly history on ${TARGET_ADDRESS}...`);
+  await updateHistory(sb, ctx.weekStart, () => true);
+  return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +439,8 @@ function lockOwnerAlive(lock) {
 
 // Does the stored history hold ANY entry for today? ("days": [] => no.)
 function hasDataForToday(rows, ctx) {
-  return rows.some(r => normalizeHistory(r.up_tracks, ctx.weekStart).days.some(d => d.date === ctx.today));
+  const row = rows.find(r => r.address === TARGET_ADDRESS);
+  return normalizeHistory(row && row.up_tracks, ctx.weekStart).days.some(d => d.date === ctx.today);
 }
 
 // Returns why an existing lock may be taken over, or null if it must be respected.
@@ -441,7 +459,7 @@ function staleLockReason(lock, rows, ctx) {
 }
 
 async function acquireLock(sb, rows, ctx) {
-  const coordAddress = rows[0].address; // first row by address: same choice for every run
+  const coordAddress = TARGET_ADDRESS; // the one history row (see TARGET_ADDRESS)
   const fresh = await readRow(sb, coordAddress);
   const raw = fresh ? fresh.up_tracks : null;
   const existing = isObj(raw) && isObj(raw.lock) ? raw.lock : null;
@@ -514,8 +532,10 @@ function detectHandle(row) {
 }
 
 function buildAccounts(rows, ctx) {
+  const row = rows.find(r => r.address === TARGET_ADDRESS);
+  const allDays = normalizeHistory(row && row.up_tracks, ctx.weekStart).days;
   return rows.map(r => {
-    const history = normalizeHistory(r.up_tracks, ctx.weekStart);
+    const history = { week_start: ctx.weekStart, days: allDays.filter(d => d.address === r.address) };
     const handle = detectHandle(r);
     return {
       address: r.address, user_id: r.user_id, app_data: r.app_data, handle,
@@ -947,6 +967,7 @@ async function runDaily({ now = new Date() } = {}) {
   // 1. Duplicate-run check against the database BEFORE generating or selecting anything.
   let rows = await fetchAllRows(sb);
   if (!rows.length) throw new Error('audius table returned no accounts');
+  if (!rows.some(r => r.address === TARGET_ADDRESS)) throw new Error(`history row not found in audius table: ${TARGET_ADDRESS}`);
   if (isBatchComplete(buildAccounts(rows, ctx))) {
     log(ALREADY_DONE_MSG);
     return { status: 'ALREADY_COMPLETED' };
@@ -955,6 +976,7 @@ async function runDaily({ now = new Date() } = {}) {
   // 2. Take the database-backed batch lock.
   const lock = await acquireLock(sb, rows, ctx);
   if (!lock) return { status: 'LOCKED' };
+  HELD_LOCK = lock;
 
   try {
     // 3. Re-check under the lock, then handle the weekly reset and interrupted runs.
@@ -1070,6 +1092,7 @@ async function runDaily({ now = new Date() } = {}) {
     printSummary(ctx, accounts, tracks.length, complete ? 'COMPLETED' : 'INCOMPLETE (re-run to recover)', failures);
     return { status: complete ? 'COMPLETED' : 'INCOMPLETE' };
   } finally {
+    HELD_LOCK = null;
     await releaseLock(sb, lock);
   }
 }
