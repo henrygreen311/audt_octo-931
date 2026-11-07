@@ -70,6 +70,7 @@ if (!sdkFactory) {
 }
 
 const log = console.log.bind(console);
+const VERBOSE = /^(1|true|yes)$/i.test(process.env.VERBOSE || '') || process.argv.includes('--verbose') || process.argv.includes('-v');
 let lastBgLog = 0;
 process.on('unhandledRejection', e => {
   if (Date.now() - lastBgLog < 30000) return;
@@ -93,6 +94,7 @@ const TARGET_ADDRESS = 'qringgreen@gmail.com';
 const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
   accountsPerRun: 50,
+  dailyPerHandle: Number(process.env.DAILY_FOLLOWERS_PER_HANDLE || 100),
   runsPerDay: 2,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
@@ -108,7 +110,6 @@ const CFG = {
   scanPages: Number(process.env.FOLLOWING_SCAN_PAGES || 10),
 };
 
-const BOTH_DONE_MSG = '[*] Both runs already done today. Exiting.';
 const HANDLE_RE = /^[A-Za-z0-9_.]{1,30}$/;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -427,6 +428,15 @@ async function verifyFollow(sdk, followerId, targetId) {
   return false;
 }
 
+function handlesBelowCap(rows, published, ctx) {
+  const today = countHandles(rows, ctx);
+  return published.filter(p => (today.get(p.handle.toLowerCase()) || 0) < CFG.dailyPerHandle);
+}
+
+function allDoneMsg(n) {
+  return `[*] All ${n} handles reached ${CFG.dailyPerHandle} followers today. Exiting.`;
+}
+
 function dayState(coord, today) {
   for (let n = 1; n <= CFG.runsPerDay; n++) {
     const b = (coord.batches || []).find(x => x.date === today && x.run_number === n);
@@ -452,7 +462,7 @@ function reason(e) {
 async function followJob(sb, ctx, run, acct, target) {
   const st = run.stats;
   const who = acct.handle ? `@${acct.handle}` : acct.address;
-  const say = text => log(`[*] ${who} -> @${target.handle} | ${text}`);
+  const say = text => { if (VERBOSE) log(`[*] ${who} -> @${target.handle} | ${text}`); };
   let verified = false;
   let already = false;
   let outcome;
@@ -485,7 +495,7 @@ async function followJob(sb, ctx, run, acct, target) {
     already ? st.already++ : st.ok++;
   } catch (e) {
     const kind = classify(e);
-    if (kind === 'rate') { outcome = 'rate'; st.rate++; run.cool.add(acct.address); say('429'); }
+    if (kind === 'rate') { outcome = 'rate'; st.rate++; say('429'); }
     else if (kind === 'permanent') { outcome = 'perm'; st.perm++; run.cool.add(acct.address); say(reason(e)); }
     else { outcome = 'retry'; st.retry++; say(reason(e)); }
     if (++run.consecFail >= CFG.failStopAfter && !run.stop) {
@@ -506,7 +516,8 @@ async function followJob(sb, ctx, run, acct, target) {
     }
     acct.followed.add(target.key);
     acct.today++;
-    say(already ? 'already following' : saved ? 'successful' : 'successful (DB save failed, kept locally)');
+    if (!saved) log(`[!] ${who} -> @${target.handle} | followed, DB save failed (kept locally)`);
+    else say(already ? 'already following' : 'successful');
   }
   if (CFG.followDelayMs) await sleep(CFG.followDelayMs);
   return outcome;
@@ -516,6 +527,7 @@ async function fillHandle(sb, ctx, run, target, need, candidates) {
   let got = 0;
   let inflight = 0;
   let transient = 0;
+  let skipped = 0;
   const step = async () => {
     if (run.abort || LOCK_LOST || run.stop) return false;
     if (CFG.maxRunMs && Date.now() - run.startedAt > CFG.maxRunMs) {
@@ -535,12 +547,13 @@ async function fillHandle(sb, ctx, run, target, need, candidates) {
     const outcome = await followJob(sb, ctx, run, acct, target);
     inflight--;
     if (outcome === 'ok' || outcome === 'already') got++;
-    else if (outcome === 'rate' || outcome === 'retry') transient++;
+    else skipped++;
+    if (outcome === 'rate' || outcome === 'retry') transient++;
     return true;
   };
   for (let n = 0; n < 3 && run.style === null; n++) if (!(await step())) break;
   await Promise.all(Array.from({ length: Math.max(1, CFG.concurrency) }, async () => { while (await step()); }));
-  return { got, transient };
+  return { got, transient, skipped };
 }
 
 function countToday(raw, ctx) {
@@ -551,13 +564,13 @@ function countToday(raw, ctx) {
   return n;
 }
 
-function countRun(rows, ctx, runNumber) {
+function countHandles(rows, ctx, runNumber) {
   const counts = new Map();
   for (const r of rows) {
     const f = r.follower;
     if (!isObj(f) || f.week_start !== ctx.weekStart || !Array.isArray(f.runs)) continue;
     for (const x of f.runs) {
-      if (x.date !== ctx.today || x.run_number !== runNumber) continue;
+      if (x.date !== ctx.today || (runNumber !== undefined && x.run_number !== runNumber)) continue;
       for (const t of x.targets || []) {
         const k = String(t.handle).toLowerCase();
         counts.set(k, (counts.get(k) || 0) + 1);
@@ -585,11 +598,23 @@ async function processRun(sb, ctx, rows, published, { runNumber, batch }) {
   const excluded = new Set(accounts.filter(a =>
     targetAddrs.has(a.address) || ids.has(String(a.user_id)) || (a.handle && keys.has(a.handle.toLowerCase()))).map(a => a.address));
 
-  const done = countRun(rows, ctx, runNumber);
-  const need = new Map(targets.map(t => [t.key, Math.max(0, CFG.accountsPerRun - (done.get(t.key) || 0))]));
+  const todayDone = countHandles(rows, ctx);
+  const runDone = countHandles(rows, ctx, runNumber);
+  const lastRun = runNumber >= CFG.runsPerDay;
+  const need = new Map(targets.map(t => {
+    const left = Math.max(0, CFG.dailyPerHandle - (todayDone.get(t.key) || 0));
+    const perRun = lastRun ? left : Math.min(left, Math.max(0, CFG.accountsPerRun - (runDone.get(t.key) || 0)));
+    return [t.key, perRun];
+  }));
   let totalNeed = 0;
-  for (const n of need.values()) totalNeed += n;
-  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${targets.length} handles, ${totalNeed} follows to do.`);
+  let active = 0;
+  for (const n of need.values()) { totalNeed += n; if (n) active++; }
+  if (!totalNeed && !unresolved) {
+    log(allDoneMsg(targets.length));
+    return { status: 'ALREADY_COMPLETED' };
+  }
+  const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= CFG.dailyPerHandle).length;
+  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} handles to do${atCap ? ` (${atCap} already at ${CFG.dailyPerHandle})` : ''}, ${totalNeed} follows.`);
 
   if (!batch) {
     await updateFollower(sb, TARGET_ADDRESS, ctx.weekStart, h => {
@@ -610,14 +635,14 @@ async function processRun(sb, ctx, rows, published, { runNumber, batch }) {
     if (run.stop) { incomplete = true; continue; }
     const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !a.followed.has(t.key) && !run.cool.has(a.address));
     const candidates = shuffle(pool).sort((x, y) => x.today - y.today);
-    const { got, transient } = await fillHandle(sb, ctx, run, t, want, candidates);
+    const { got, transient, skipped } = await fillHandle(sb, ctx, run, t, want, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
-    const total = CFG.accountsPerRun - want + got;
+    const day = (todayDone.get(t.key) || 0) + got;
     if (got < want) {
       if (transient || run.stop) incomplete = true;
-      log(`[!] @${t.handle} | ${total}/${CFG.accountsPerRun}${transient || run.stop ? '' : ' (no more accounts available)'}`);
+      log(`[!] @${t.handle} | ${day}/${CFG.dailyPerHandle} today${transient || run.stop ? '' : ' (no more accounts available)'}`);
     } else {
-      log(`[*] @${t.handle} | ${total}/${CFG.accountsPerRun} done`);
+      log(`[*] @${t.handle} | ${day}/${CFG.dailyPerHandle} today${day >= CFG.dailyPerHandle ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
     }
   }
 
@@ -656,8 +681,12 @@ async function runFollower({ now = new Date() } = {}) {
   if (isObj(coordRaw) && coordRaw.week_start && coordRaw.week_start !== ctx.weekStart) {
     log('[*] New week: history reset.');
   }
+  if (!handlesBelowCap(rows, published, ctx).length) {
+    log(allDoneMsg(published.length));
+    return { status: 'ALREADY_COMPLETED' };
+  }
   if (!dayState(normalizeFollower(coordRaw, ctx.weekStart), ctx.today)) {
-    log(BOTH_DONE_MSG);
+    log('[*] Both runs already done today. Exiting.');
     return { status: 'ALREADY_COMPLETED' };
   }
 
@@ -671,9 +700,13 @@ async function runFollower({ now = new Date() } = {}) {
     await flushPending(sb, ctx);
     rows = await fetchRows(sb);
     const coord = normalizeFollower(rows.find(r => r.address === TARGET_ADDRESS).follower, ctx.weekStart);
+    if (!handlesBelowCap(rows, published, ctx).length) {
+      log(allDoneMsg(published.length));
+      return { status: 'ALREADY_COMPLETED' };
+    }
     const state = dayState(coord, ctx.today);
     if (!state) {
-      log(BOTH_DONE_MSG);
+      log('[*] Both runs already done today. Exiting.');
       return { status: 'ALREADY_COMPLETED' };
     }
     return await processRun(sb, ctx, rows, published, state);
