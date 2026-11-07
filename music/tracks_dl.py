@@ -57,21 +57,12 @@ def delete_track(client: httpx.Client, headers: dict, task_id: str, title: str =
         print(f"[!] Delete request failed for {task_id}: {e}")
 
 
-def download_tracks(supabase, task_ids: list[str]) -> bool:
-    """
-    Polls AceMusic API until all specified local_audio URLs appear.
-    Downloads tracks and covers, deletes them from the server, and cleans up leftovers.
-    """
-    if not task_ids:
-        return True
+POLL_URL = "https://acemusic.ai/api/songs?limit=40&sort=new&hide=rating%3Adisliked"
+FAILED_STATUSES = ("failed", "cancelled", "canceled", "error")
 
-    cookie = get_latest_cookie(supabase)
-    
-    # Ensure images directory exists
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
-    url = "https://acemusic.ai/api/songs?limit=40&sort=new&hide=rating%3Adisliked"
-    headers = {
+def build_headers(cookie: str) -> dict:
+    return {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.5",
@@ -81,97 +72,175 @@ def download_tracks(supabase, task_ids: list[str]) -> bool:
         "Cookie": cookie,
     }
 
+
+def unique_basename(title: str, task_id: str, used: set) -> str:
+    """File base name for a song. Never empty, never reused within one run."""
+    base = re.sub(r"[^a-zA-Z0-9]+", "-", title or "").strip("-").lower()
+    if not base:  # e.g. a non-ASCII title would otherwise produce ".mp3"
+        base = f"track-{task_id[-6:]}"
+    name, n = base, 2
+    while name in used:  # two songs with the same title must not overwrite each other
+        name = f"{base}-{n}"
+        n += 1
+    used.add(name)
+    return name
+
+
+def fetch_song_direct(client: httpx.Client, headers: dict, task_id: str):
+    """Fallback when a task is missing from the 'newest 40' list: ask for it directly."""
+    try:
+        resp = client.get(f"https://acemusic.ai/api/songs/{task_id}", headers=headers, timeout=20.0)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        song = data.get("song") if isinstance(data.get("song"), dict) else data
+        return song if isinstance(song, dict) and song.get("task_id", task_id) == task_id else None
+    except Exception:
+        return None
+
+
+def download_song(client: httpx.Client, headers: dict, song: dict, used: set):
+    """Downloads audio (required) and cover (optional). Returns the title on success, else None."""
+    t_id = song.get("task_id")
+    title = (song.get("meta") or {}).get("title", "Untitled")
+    base = unique_basename(title, t_id, used)
+    audio_filename = f"{base}.mp3"
+    try:
+        audio_path = song["local_audio"].lstrip("/")
+        file_resp = client.get(f"https://acemusic.ai/{audio_path}", headers=headers, timeout=60.0)
+        file_resp.raise_for_status()
+        with open(SCRIPT_DIR / audio_filename, "wb") as f:
+            f.write(file_resp.content)
+        print(f"[+] Downloaded: {audio_filename}")
+    except Exception as e:
+        used.discard(base)
+        print(f"[!] Failed to download audio for {t_id}: {e}")
+        return None
+
+    cover_path = song.get("local_cover")
+    if cover_path:
+        try:
+            clean_cover_path = cover_path.lstrip("/").split("?")[0]
+            c_resp = client.get(f"https://acemusic.ai/{clean_cover_path}", headers=headers, timeout=30.0)
+            if c_resp.status_code == 200:
+                with open(IMAGES_DIR / f"{base}.jpg", "wb") as f:
+                    f.write(c_resp.content)
+                print(f"[+] Downloaded cover: images/{base}.jpg")
+            else:
+                print(f"[!] Cover download returned HTTP {c_resp.status_code} for {t_id}")
+        except Exception as e:
+            print(f"[!] Failed to download cover for {t_id}: {e}")
+    else:
+        print(f"[!] No cover available for {t_id} ({base}).")
+    return title
+
+
+def download_tracks(supabase, task_ids: list[str]) -> bool:
+    """
+    Polls AceMusic until every task has a local_audio URL, downloads audio + covers,
+    and only AFTER all downloads are finished deletes the songs from the server.
+    """
+    if not task_ids:
+        return True
+
+    cookie = get_latest_cookie(supabase)
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    headers = build_headers(cookie)
+
     pending = set(task_ids)
+    downloaded = {}                       # task_id -> title (deleted later)
+    used_names = set()
+    missing_polls = {t: 0 for t in pending}
     print(f"[*] Waiting for {len(pending)} track(s) to finish generating...")
     print("[*] Initial 30s wait before polling...")
     time.sleep(30)
 
     max_attempts = 120  # 120 * 10s = 20 minutes max wait
-    
+
     for attempt in range(max_attempts):
         if not pending:
             break
 
+        status_report = {}
         try:
             with httpx.Client(follow_redirects=True) as client:
-                resp = client.get(url, headers=headers, timeout=20.0)
-                if resp.status_code == 200:
+                resp = client.get(POLL_URL, headers=headers, timeout=20.0)
+
+                if resp.status_code == 401:
+                    print("[!] Song list returned 401 (session expired). Refreshing cookie...")
+                    try:
+                        from login import login_and_update_cookie
+                        new_cookie = login_and_update_cookie() or get_latest_cookie(supabase)
+                        if new_cookie:
+                            headers = build_headers(new_cookie)
+                    except Exception as e:
+                        print(f"[!] Cookie refresh failed: {e}")
+                elif resp.status_code != 200:
+                    print(f"[!] Song list returned HTTP {resp.status_code}: {resp.text[:120]}")
+                else:
                     items = resp.json().get("items", [])
-                    
-                    for song in items:
-                        t_id = song.get("task_id")
-                        if t_id in pending:
-                            status = song.get("status")
-                            
-                            if status in ("failed", "cancelled"):
-                                print(f"[!] Task {t_id} failed with status: {status}")
-                                pending.remove(t_id)
-                                
-                            elif song.get("local_audio"):
-                                print(f"[*] Task {t_id} completed! Starting download...")
-                                audio_path = song.get("local_audio")
-                                cover_path = song.get("local_cover")
-                                title = song.get("meta", {}).get("title", "Untitled")
+                    by_id = {s.get("task_id"): s for s in items if s.get("task_id")}
 
-                                safe_title = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower()
-                                audio_filename = f"{safe_title}.mp3"
-                                audio_save_path = SCRIPT_DIR / audio_filename
+                    for t_id in sorted(pending):
+                        song = by_id.get(t_id)
+                        if song is None:
+                            missing_polls[t_id] += 1
+                            if missing_polls[t_id] >= 3:      # not in the newest 40 for 3 polls
+                                song = fetch_song_direct(client, headers, t_id)
+                        else:
+                            missing_polls[t_id] = 0
 
-                                try:
-                                    # 1. Download Audio
-                                    clean_audio_path = audio_path.lstrip("/")
-                                    full_audio_url = f"https://acemusic.ai/{clean_audio_path}"
-                                    file_resp = client.get(full_audio_url, headers=headers, timeout=60.0)
-                                    file_resp.raise_for_status()
-                                    with open(audio_save_path, "wb") as f:
-                                        f.write(file_resp.content)
-                                    print(f"[+] Downloaded: {audio_filename}")
+                        if song is None:
+                            status_report[t_id] = "not-in-list"
+                            continue
 
-                                    # 2. Download Cover (if available)
-                                    if cover_path:
-                                        clean_cover_path = cover_path.lstrip("/").split("?")[0]
-                                        full_cover_url = f"https://acemusic.ai/{clean_cover_path}"
-                                        cover_filename = f"{safe_title}.jpg"
-                                        cover_save_path = IMAGES_DIR / cover_filename
-                                        
-                                        c_resp = client.get(full_cover_url, headers=headers, timeout=30.0)
-                                        if c_resp.status_code == 200:
-                                            with open(cover_save_path, "wb") as f:
-                                                f.write(c_resp.content)
-                                            print(f"[+] Downloaded cover: images/{cover_filename}")
+                        status = song.get("status")
+                        status_report[t_id] = status or "unknown"
 
-                                    # 3. Delete from acemusic
-                                    delete_track(client, headers, t_id, title)
-                                    pending.remove(t_id)
-
-                                except Exception as dl_err:
-                                    print(f"[!] Failed to download files for {t_id}: {dl_err}")
-
+                        if status in FAILED_STATUSES:
+                            print(f"[!] Task {t_id} failed with status: {status}")
+                            pending.discard(t_id)
+                        elif song.get("local_audio"):
+                            print(f"[*] Task {t_id} completed! Starting download...")
+                            title = download_song(client, headers, song, used_names)
+                            if title is not None:
+                                downloaded[t_id] = title
+                                pending.discard(t_id)
         except Exception as e:
             print(f"[!] API check failed: {e}")
 
         if pending:
-            print(f"[*] {len(pending)} track(s) remaining... (attempt {attempt+1}/{max_attempts})")
+            states = ", ".join(f"{t[-6:]}={status_report.get(t, '?')}" for t in sorted(pending))
+            print(f"[*] {len(pending)} track(s) remaining... [{states}] (attempt {attempt+1}/{max_attempts})")
             time.sleep(10)
 
     if pending:
-        print(f"[!] Timed out waiting for {len(pending)} tracks.")
+        print(f"[!] Timed out waiting for {len(pending)} tracks: {sorted(pending)}")
+
+    # --- Delete downloaded songs only now, so nothing is removed while others are still generating ---
+    if downloaded:
+        try:
+            with httpx.Client(follow_redirects=True) as client:
+                for t_id, title in downloaded.items():
+                    delete_track(client, headers, t_id, title)
+        except Exception as e:
+            print(f"[!] Delete step failed: {e}")
 
     # --- Cleanup any leftover/duplicate songs ---
     print("[*] Checking for leftover/duplicate songs...")
     try:
         with httpx.Client() as client:
-            cleanup_resp = client.get(url, headers=headers, timeout=20.0)
+            cleanup_resp = client.get(POLL_URL, headers=headers, timeout=20.0)
             if cleanup_resp.status_code == 200:
                 leftovers = cleanup_resp.json().get("items", [])
                 leftover_count = 0
                 for item in leftovers:
                     t_id = item.get("task_id")
-                    t_title = item.get("meta", {}).get("title", "Untitled")
+                    t_title = (item.get("meta") or {}).get("title", "Untitled")
                     if t_id:
                         delete_track(client, headers, t_id, t_title)
                         leftover_count += 1
-                
+
                 if leftover_count > 0:
                     print(f"[+] Cleanup complete. Removed {leftover_count} leftover song(s).")
                 else:
