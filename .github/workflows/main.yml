@@ -76,7 +76,7 @@ jobs:
           date -u
 
           timeout --signal=TERM --kill-after=60s 335m \
-            python3 -u music/create_track.py
+            python3 main.py upload_track.js
 
           echo "Audius monitor finished."
           date -u
