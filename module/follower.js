@@ -1,25 +1,58 @@
 #!/usr/bin/env node
 'use strict';
 
-/**
- * module/follower.js - two daily batches of 50 follower accounts that follow today's
- * published Audius handles (read from audius.up_tracks, never written).
- * Jobs run strictly one at a time: one account follows one handle, then the next.
- *
- * Storage (audius.follower, jsonb):
- *   every follower account : { week_start, runs: [ { date, day, run_number, targets: [ { handle, followed_at } ] } ], v }
- *   qringgreen row (coordinator) additionally holds the shared batch state:
- *       batches: [ { date, run_number, accounts: [address...], done } ]   and a temporary  lock
- *   Only successful follows are stored. "v" is a write counter used for safe (compare-and-set) updates.
- *
- * Independent of upload_track.js: nothing is imported from it, and up_tracks is only read.
- */
-
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+
+// --- Cloudflare Worker proxies for api.audius.co: one is picked at random per request ---
+// Never connects directly. If a proxy cannot be reached, another one is tried, then the request is
+// retried with a short backoff. Override the list with AUDIUS_PROXY_URLS (comma separated).
+const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS || 'https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev')
+  .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
+const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
+{
+  const realFetch = globalThis.fetch;
+  const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+  const downUntil = new Map(); // proxy -> time before which it is avoided
+  const warned = new Set();
+  const ATTEMPTS = Number(process.env.PROXY_ATTEMPTS || 6);
+  const pick = () => {
+    const now = Date.now();
+    const up = PROXY_URLS.filter(u => (downUntil.get(u) || 0) <= now);
+    const pool = up.length ? up : PROXY_URLS; // all marked down: still try, never go direct
+    return pool[Math.floor(Math.random() * pool.length)];
+  };
+  console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
+  globalThis.fetch = async (input, init) => {
+    const isReq = typeof input === 'object' && input !== null && 'url' in input;
+    let url;
+    try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
+    if (url.hostname !== 'api.audius.co') return realFetch(input, init);
+    const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
+    if (PROXY_KEY) headers.set('x-proxy-key', PROXY_KEY);
+    let lastErr;
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+      const proxy = pick();
+      const target = proxy + url.pathname + url.search;
+      try {
+        return isReq && !init
+          ? await realFetch(new Request(target, input.clone()), { headers })
+          : await realFetch(target, { ...init, headers });
+      } catch (e) {
+        const code = e && ((e.cause && e.cause.code) || e.code);
+        if (!CONNECT_ERRS.has(code)) throw e; // not a connection failure: the request may have been sent
+        lastErr = e;
+        downUntil.set(proxy, Date.now() + 20000);
+        if (!warned.has(proxy)) { warned.add(proxy); console.log(`[!] Proxy ${new URL(proxy).host} unreachable; using another.`); }
+        await new Promise(r => setTimeout(r, 300 * attempt));
+      }
+    }
+    throw lastErr;
+  };
+}
 
 // --- Safely resolve SDK (same approach as upload_track.js) ---
 let sdkPkg;
@@ -42,6 +75,13 @@ if (!sdkFactory) {
 
 // --- Silence SDK noise ---
 const log = console.log.bind(console);
+let lastBgLog = 0;
+process.on('unhandledRejection', e => { // e.g. the SDK's background storage-node refresh timing out
+  if (Date.now() - lastBgLog < 30000) return;
+  lastBgLog = Date.now();
+  const c = e && e.cause && e.cause.code;
+  log(`[!] Background network error${c ? ` (${c})` : ''}; continuing.`);
+});
 for (const level of ['log', 'info', 'debug', 'warn']) {
   const orig = console[level].bind(console);
   console[level] = (...args) => {
@@ -64,17 +104,17 @@ const CFG = {
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
   retryBaseMs: Number(process.env.RETRY_BASE_MS || 2000),
   verifyTries: 3,
-  verifyDelayMs: Number(process.env.VERIFY_DELAY_MS || 1500),
+  verifyDelayMs: Number(process.env.VERIFY_DELAY_MS || 500), // waits 1x, 2x, 3x this between checks
   ratePauseMs: Number(process.env.RATE_PAUSE_MS || 15000), // pause after each 429
   rateStopAfter: Number(process.env.RATE_STOP_AFTER || 10), // this many 429s in a row => stop, resume next run
-  followDelayMs: Number(process.env.FOLLOW_DELAY_MS || 300),
-  callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000, // hard limit per SDK call
+  followDelayMs: Number(process.env.FOLLOW_DELAY_MS || 100),
+  concurrency: Number(process.env.CONCURRENCY || 5), // follow jobs in parallel (one per account)
+  callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 20) * 1000, // hard limit per SDK call
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000, // 0 = no limit; else stop cleanly, next run resumes
-  progressEvery: Number(process.env.PROGRESS_EVERY || 5), // log a progress line every N follow jobs
   scanPages: Number(process.env.FOLLOWING_SCAN_PAGES || 10), // fallback check: pages of 100 followings
 };
 
-const BOTH_DONE_MSG = '[!] Both follower runs for today have already been completed. Exiting.';
+const BOTH_DONE_MSG = '[*] Both runs already done today. Exiting.';
 const HANDLE_RE = /^[A-Za-z0-9_.]{1,30}$/;
 
 // ---------------------------------------------------------------------------
@@ -301,7 +341,7 @@ async function flushPending(sb, ctx) {
     if (p.week_start !== ctx.weekStart) continue; // that week's history no longer exists
     try { await recordFollow(sb, ctx.weekStart, p.address, p); } catch (_) { keep.push(p); }
   }
-  log(`[+] Recovered ${PENDING.length - keep.length}/${PENDING.length} unsaved follow(s) from the local journal.`);
+  log(`[*] Recovered ${PENDING.length - keep.length}/${PENDING.length} unsaved follows.`);
   PENDING = keep;
   savePending();
 }
@@ -329,7 +369,7 @@ async function acquireLock(sb, ctx) {
     if (h.lock && h.lock.token) {
       const why = lockStaleReason(h.lock);
       if (!why) { blocked = h.lock; return false; }
-      log(`[~] Taking over batch lock from ${h.lock.acquired_at}: ${why}.`);
+      log('[*] Took over lock from a stopped run.');
     }
     h.lock = {
       token, acquired_at: new Date().toISOString(), beat: new Date().toISOString(),
@@ -337,7 +377,7 @@ async function acquireLock(sb, ctx) {
     };
     return true;
   });
-  if (blocked) { log(`[!] Another follower run holds the batch lock (since ${blocked.acquired_at}). Exiting.`); return null; }
+  if (blocked) { log('[!] Another run is active. Exiting.'); return null; }
   return { token };
 }
 
@@ -370,7 +410,7 @@ async function releaseLock(sb, ctx, lock) {
       return true;
     });
   } catch (e) {
-    console.error(`[!] Could not release batch lock (it will expire on its own): ${e.message}`);
+    console.error(`[!] Could not release lock (it expires on its own): ${e.message}`);
   }
 }
 
@@ -395,10 +435,10 @@ async function resolveTargets(published, sdk) {
       const res = await readRetry(() => sdk.users.getUserByHandle({ handle: t.handle }));
       const id = res && res.data && res.data.id;
       if (id) targets.push({ ...t, id: String(id), key: t.handle.toLowerCase() });
-      else log(`[!] @${t.handle} was not found on Audius; skipping it.`);
+      else log(`[!] @${t.handle} not found; skipped.`);
     } catch (e) {
-      if (classify(e) === 'permanent') log(`[!] @${t.handle} was not found on Audius; skipping it.`);
-      else { unresolved++; log(`[!] Could not look up @${t.handle} (${errMsg(e)}); it will be retried on the next run.`); }
+      if (classify(e) === 'permanent') log(`[!] @${t.handle} not found; skipped.`);
+      else { unresolved++; log(`[!] @${t.handle} lookup failed (${errMsg(e)}); retry next run.`); }
     }
   }
   return { targets, unresolved };
@@ -422,7 +462,7 @@ async function isFollowing(sdk, followerId, targetId) {
 
 async function verifyFollow(sdk, followerId, targetId) {
   for (let i = 1; i <= CFG.verifyTries; i++) {
-    await sleep(CFG.verifyDelayMs);
+    await sleep(CFG.verifyDelayMs * i);
     if (await isFollowing(sdk, followerId, targetId)) return true;
   }
   return false;
@@ -461,20 +501,16 @@ const FOLLOW_STYLES = [
   (f, t) => ({ id: f, userId: f, followeeUserId: t }), // id = the user doing the following
 ];
 
-const label0 = a => a.handle || a.address;
-
 async function followJob(sb, ctx, run, acct, target) {
   const st = run.stats;
   if (run.abort || LOCK_LOST) return;
   if (!run.stop && CFG.maxRunMs && Date.now() - run.startedAt > CFG.maxRunMs) {
     run.stop = true;
-    log('[!] Time budget reached; stopping this run cleanly. The next execution resumes it.');
+    log('[!] Time limit reached; stopping. Next run resumes.');
   }
   if (run.stop || run.cool.has(acct.address)) { st.retry++; return; } // left for the next run
-  run.jobs = (run.jobs || 0) + 1;
-  if (CFG.progressEvery && run.jobs % CFG.progressEvery === 1) {
-    log(`[~] job ${run.jobs}/${run.total} (${Math.round((Date.now() - run.startedAt) / 1000)}s): ${label0(acct)} -> ${target.handle}`);
-  }
+  const wait = run.pauseUntil - Date.now(); // shared pause after a rate limit
+  if (wait > 0) await sleep(wait);
   const label = acct.handle || acct.address;
   let verified = false;
   try {
@@ -493,7 +529,7 @@ async function followJob(sb, ctx, run, acct, target) {
           if (!statusOf(e) && /required parameter|invalid/i.test(String(e.message))) continue; // rejected before sending
         }
         if (await verifyFollow(sdk, acct.user_id, target.id)) {
-          if (run.style === null) { run.style = i; log(`[*] followUser parameter layout #${i + 1} works.`); }
+          if (run.style === null) run.style = i;
           lastErr = null;
           verified = true;
           break;
@@ -509,14 +545,17 @@ async function followJob(sb, ctx, run, acct, target) {
     if (kind === 'rate') {
       run.cool.add(acct.address);
       st.rate++;
-      log(`[!] Rate limit encountered: ${label} -> ${target.handle}. Skipping for now.`);
       if (++run.consecRate >= CFG.rateStopAfter && !run.stop) {
         run.stop = true;
-        log(`[!] ${run.consecRate} rate limits in a row; stopping this run early. The next execution resumes it.`);
-      } else if (CFG.ratePauseMs) await sleep(CFG.ratePauseMs); // back off instead of hammering Audius
+        log('[!] Too many rate limits; stopping. Next run resumes.');
+      } else if (CFG.ratePauseMs && Date.now() >= run.pauseUntil) {
+        run.pauseUntil = Date.now() + CFG.ratePauseMs; // every worker waits, not just this one
+        log(`[!] Rate limited; pausing ${Math.round(CFG.ratePauseMs / 1000)}s.`);
+      }
     } else {
       st[kind === 'permanent' ? 'perm' : 'retry']++;
-      if (st.logged++ < 10) log(`[!] ${label} -> ${target.handle}: ${errMsg(e)}`);
+      const msg = errMsg(e).slice(0, 90);
+      if (!run.seenErr.has(msg) && run.seenErr.size < 5) { run.seenErr.add(msg); log(`[!] ${label} -> @${target.handle}: ${msg}`); }
     }
   }
   if (verified) {
@@ -527,7 +566,7 @@ async function followJob(sb, ctx, run, acct, target) {
     try { await recordFollow(sb, ctx.weekStart, acct.address, item); } catch (e) {
       PENDING.push(item); savePending(); // the follow happened: keep enough to record it without following again
       if (e instanceof LockLostError) run.abort = e;
-      else log(`[!] ${label} -> ${target.handle}: followed, but the database save failed; kept for recovery.`);
+      else if (st.dbFail++ < 3) log(`[!] DB save failed for ${label}; kept locally.`);
     }
     acct.followed.add(target.key);
   }
@@ -547,19 +586,19 @@ async function processRun(sb, ctx, rows, published, coord, { runNumber, batch })
   if (!reader) throw new Error('no account with complete credentials');
 
   const { targets, unresolved } = await resolveTargets(published, makeSdk(reader));
-  if (!targets.length) { log("[!] None of today's handles could be resolved on Audius. Exiting."); return { status: 'NO_TARGETS' }; }
+  if (!targets.length) { log('[!] No handles found on Audius. Exiting.'); return { status: 'NO_TARGETS' }; }
 
   let members;
   if (batch) {
     members = batch.accounts.map(a => byAddr.get(a)).filter(a => a && a.hasCreds);
-    log(`[*] Resuming run ${runNumber}: ${members.length} account(s), ${targets.length} handle(s).`);
+    log(`[*] Run ${runNumber} (resumed): ${members.length} accounts, ${targets.length} handles.`);
   } else {
     const targetAddrs = new Set(published.map(p => p.address).filter(Boolean));
     const usedToday = new Set();
     for (const b of coord.batches || []) if (b.date === ctx.today) b.accounts.forEach(a => usedToday.add(a));
     members = selectAccounts(accounts, targets, targetAddrs, usedToday, CFG.accountsPerRun);
-    log(`[*] Run ${runNumber}: ${members.length} follower account(s) selected, ${targets.length} handle(s) to follow.`);
-    if (members.length < CFG.accountsPerRun) log(`[~] Only ${members.length} eligible account(s) available (wanted ${CFG.accountsPerRun}).`);
+    log(`[*] Run ${runNumber}: ${members.length} accounts, ${targets.length} handles.`);
+    if (members.length < CFG.accountsPerRun) log(`[!] Only ${members.length} of ${CFG.accountsPerRun} accounts available.`);
     await updateFollower(sb, TARGET_ADDRESS, ctx.weekStart, h => {
       if (!h.batches) h.batches = [];
       h.batches.push({ date: ctx.today, run_number: runNumber, accounts: members.map(m => m.address), done: members.length === 0 && !unresolved });
@@ -567,20 +606,25 @@ async function processRun(sb, ctx, rows, published, coord, { runNumber, batch })
     });
   }
 
-  const run = { startedAt: Date.now(), jobs: 0, total: targets.reduce((n, t) => n + members.filter(a => !a.followed.has(t.key)).length, 0), number: runNumber, cool: new Set(), abort: null, stop: false, style: null, consecRate: 0, sdks: new Map(), stats: { ok: 0, already: 0, rate: 0, retry: 0, perm: 0, logged: 0 } };
+  const run = { startedAt: Date.now(), pauseUntil: 0, seenErr: new Set(), number: runNumber, cool: new Set(), abort: null, stop: false, style: null, consecRate: 0, sdks: new Map(), stats: { ok: 0, already: 0, rate: 0, retry: 0, perm: 0, dbFail: 0 } };
   const st = run.stats;
 
-  // One handle at a time: every selected account follows handle #1, then handle #2, ... (spreads the load).
+  // One handle at a time; its accounts follow in parallel (CONCURRENCY at once, each account at most one job).
   for (const t of targets) {
-    const todo = members.filter(a => !a.followed.has(t.key));
-    if (!todo.length) continue;
+    const queue = members.filter(a => !a.followed.has(t.key));
+    if (!queue.length) continue;
+    const total = queue.length;
     const before = st.ok + st.already;
-    for (const a of todo) {
-      if (run.abort || LOCK_LOST) break;
-      await followJob(sb, ctx, run, a, t); // strictly sequential
+    const next = () => run.abort || LOCK_LOST ? undefined : queue.shift();
+    for (let n = 0; n < 3 && run.style === null && queue.length; n++) { // first jobs alone: detect the follow format once
+      const a = next(); if (!a) break;
+      await followJob(sb, ctx, run, a, t);
     }
+    await Promise.all(Array.from({ length: Math.max(1, CFG.concurrency) }, async () => {
+      for (let a = next(); a; a = next()) await followJob(sb, ctx, run, a, t);
+    }));
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
-    log(`[*] @${t.handle}: ${st.ok + st.already - before}/${todo.length} followed.`);
+    log(`[*] @${t.handle} ${st.ok + st.already - before}/${total}`);
   }
 
   const left = st.rate + st.retry + unresolved; // work that a later run should pick up
@@ -592,8 +636,13 @@ async function processRun(sb, ctx, rows, published, coord, { runNumber, batch })
       return true;
     });
   }
-  log(`[+] Run ${runNumber}: ${st.ok} followed, ${st.already} already following, ${st.rate} rate-limited, ${st.retry} to retry, ${st.perm} failed. ` +
-    (left ? 'INCOMPLETE (the next execution resumes this run).' : 'COMPLETED.'));
+  const parts = [`${st.ok} followed`];
+  if (st.already) parts.push(`${st.already} already following`);
+  if (st.rate) parts.push(`${st.rate} rate-limited`);
+  if (st.retry) parts.push(`${st.retry} to retry`);
+  if (st.perm) parts.push(`${st.perm} failed`);
+  if (unresolved) parts.push(`${unresolved} handle(s) unresolved`);
+  log(`[*] Run ${runNumber} ${left ? 'incomplete' : 'complete'}: ${parts.join(', ')}.${left ? ' Next run resumes.' : ''}`);
   return { status: left ? 'INCOMPLETE' : 'COMPLETED' };
 }
 
@@ -608,7 +657,7 @@ async function runFollower({ now = new Date() } = {}) {
   // 1. Today's successfully published handles (read-only).
   const published = todaysHandles(await readUpTracks(sb), ctx.today);
   if (!published.length) {
-    log('[!] No successfully published handles found for today. Exiting.');
+    log('[!] No handles published today. Exiting.');
     return { status: 'NO_TARGETS' };
   }
 
@@ -616,7 +665,7 @@ async function runFollower({ now = new Date() } = {}) {
   let rows = await fetchRows(sb);
   const coordRaw = rows.find(r => r.address === TARGET_ADDRESS).follower;
   if (isObj(coordRaw) && coordRaw.week_start && coordRaw.week_start !== ctx.weekStart) {
-    log(`[*] New week ${ctx.weekStart}: follower history reset.`);
+    log('[*] New week: history reset.');
   }
   if (!dayState(normalizeFollower(coordRaw, ctx.weekStart), ctx.today)) {
     log(BOTH_DONE_MSG);
