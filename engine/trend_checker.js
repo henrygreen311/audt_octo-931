@@ -112,6 +112,7 @@ const CFG = {
 };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+let ABORT = null; // set when a problem makes every further attempt pointless
 const statusOf = e => e && ((e.response && e.response.status) || e.status);
 const errMsg = e => `${statusOf(e) ? `HTTP ${statusOf(e)} ` : ''}${(e && e.message) || e}`;
 const isRateLimit = e => statusOf(e) === 429 || /rate.?limit|too many requests|\b429\b/i.test(String((e && e.message) || e));
@@ -189,23 +190,44 @@ function getSdk(acct) {
   return sdk;
 }
 
-async function readName(acct) {
+async function readUser(acct) {
   const res = await withRetry(() => getSdk(acct).users.getUser({ id: acct.user_id }), 'getUser');
   const d = res && res.data;
   if (!d) throw Object.assign(new Error('user not found'), { status: 404 });
+  return d;
+}
+
+async function readName(acct) {
+  const d = await readUser(acct);
   return typeof d.name === 'string' ? d.name : '';
 }
 
-// sets the display name (handle untouched) and confirms it really changed
+// sets the display name (handle untouched), confirms it changed and that nothing else did
 async function setName(acct, name) {
   const sdk = getSdk(acct);
-  if (!sdk.users || typeof sdk.users.updateProfile !== 'function') {
-    throw Object.assign(new Error('installed @audius/sdk has no users.updateProfile(); check the SDK version'), { status: 400 });
+  if (!sdk.users || typeof sdk.users.updateUser !== 'function') {
+    throw Object.assign(new Error('installed @audius/sdk has no users.updateUser(); run with --inspect'), { fatal: true });
   }
-  await withRetry(() => sdk.users.updateProfile({ userId: acct.user_id, metadata: { name } }), 'updateProfile');
+  const before = await readUser(acct);
+  try {
+    await withRetry(() => sdk.users.updateUser({ id: acct.user_id, userId: acct.user_id, metadata: { name } }), 'updateUser');
+  } catch (e) {
+    // wrong call shape is the same for every account, so stop instead of failing 451 times
+    if (/required parameter|requestParameters|is not valid|invalid (metadata|body)/i.test(String((e && e.message) || e)) && !statusOf(e)) {
+      throw Object.assign(new Error(`updateUser call shape rejected by the SDK: ${e.message}`), { fatal: true });
+    }
+    throw e;
+  }
   for (let i = 1; i <= CFG.verifyTries; i++) {
     await sleep(CFG.verifyDelayMs * i);
-    if ((await readName(acct)) === name) return;
+    const after = await readUser(acct);
+    if (after.name !== name) continue;
+    for (const k of ['handle', 'bio', 'location']) {
+      if (before[k] !== undefined && after[k] !== before[k]) {
+        throw Object.assign(new Error(`updateUser also changed "${k}" on ${whoOf(acct)} (was ${JSON.stringify(before[k])}, now ${JSON.stringify(after[k])}); stopping so nothing else is damaged`), { fatal: true });
+      }
+    }
+    return;
   }
   throw new Error('display name change could not be verified');
 }
@@ -261,6 +283,7 @@ async function task1Job(acct, nextName, dry) {
       log(`[+] ${who} -> "${name}"`);
       return 'ok';
     } catch (e) {
+      if (e.fatal) throw e;
       log(`[!] ${who} -> "${name}" failed (${errMsg(e)}); trying another name`);
       if ([401, 403].includes(statusOf(e))) break; // credentials problem, another name won't help
     }
@@ -290,6 +313,7 @@ async function task2Job(acct, dry) {
     log(`[+] ${who} | "${old}" -> "${next}"`);
     return 'ok';
   } catch (e) {
+    if (e.fatal) throw e;
     log(`[x] ${who} | "${old}" -> "${next}" failed (${errMsg(e)})`);
     return 'fail';
   }
@@ -311,13 +335,17 @@ async function runTask(label, domain, rows, key, opts, job) {
 
   const stats = { ok: 0, skip: 0, fail: 0 };
   await Promise.all(Array.from({ length: Math.max(1, CFG.concurrency) }, async () => {
-    while (todo.length) {
+    while (todo.length && !ABORT) {
       const acct = todo.shift();
       let outcome;
-      try { outcome = await job(acct); } catch (e) { log(`[x] ${whoOf(acct)} | ${errMsg(e)}`); outcome = 'fail'; }
+      try { outcome = await job(acct); } catch (e) {
+        if (e.fatal) { if (!ABORT) { ABORT = e; log(`[!] Stopping: ${e.message}`); } break; }
+        log(`[x] ${whoOf(acct)} | ${errMsg(e)}`); outcome = 'fail';
+      }
       stats[outcome]++;
     }
   }));
+  if (ABORT) log('[!] Aborted early; nothing else was attempted.');
   log(`[*] ${label} finished: ${stats.ok} changed, ${stats.skip} skipped, ${stats.fail} failed.`);
 }
 
@@ -329,15 +357,47 @@ function parseArgs(argv) {
     else if (a === '--force') opts.force = true;
     else if (a === '--task') opts.task = argv[++i];
     else if (a === '--limit') opts.limit = Number(argv[++i]) || 0;
+    else if (a === '--inspect') opts.inspect = true;
   }
   if (!['all', '1', '2'].includes(opts.task)) throw new Error('--task must be 1, 2 or all');
   return opts;
+}
+
+function methodsOf(obj) {
+  const names = new Set();
+  for (let o = obj; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+    for (const k of Object.getOwnPropertyNames(o)) {
+      if (k !== 'constructor' && typeof obj[k] === 'function') names.add(k);
+    }
+  }
+  return [...names].sort();
+}
+
+async function inspectSdk(sb) {
+  let version = 'unknown';
+  try {
+    let dir = path.dirname(require.resolve('@audius/sdk'));
+    for (let i = 0; i < 6; i++, dir = path.dirname(dir)) {
+      const f = path.join(dir, 'package.json');
+      if (fs.existsSync(f)) { const j = JSON.parse(fs.readFileSync(f, 'utf8')); if (j.name === '@audius/sdk') { version = j.version; break; } }
+    }
+  } catch (_) {}
+  log(`[*] @audius/sdk version: ${version}`);
+  const rows = await fetchAccounts(sb, TASK1_DOMAIN);
+  const acct = rows.find(hasCreds);
+  if (!acct) { log('[!] no account with complete credentials to build an SDK from'); return; }
+  const sdk = getSdk(acct);
+  log(`[*] sdk keys: ${Object.keys(sdk).join(', ')}`);
+  for (const m of ['updateUser', 'updateUserRaw']) {
+    if (sdk.users && typeof sdk.users[m] === 'function') log(`[*] ${m} source:\n${String(sdk.users[m]).slice(0, 2500)}`);
+  }
 }
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const sb = connectSupabase();
   STATE = loadState();
+  if (opts.inspect) return inspectSdk(sb);
 
   if (opts.task === 'all' || opts.task === '1') {
     const nextName = makeNamePool(loadNames());
