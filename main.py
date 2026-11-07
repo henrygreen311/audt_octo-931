@@ -41,9 +41,9 @@ async def run_module(module_name: str):
     
     # 1. Check if it's a JavaScript module
     if module_name.endswith(".js"):
-        js_path = ROOT_DIR / "module" / module_name
+        js_path = ROOT_DIR / "engine" / module_name
         if not js_path.exists():
-            print(f"[!] JS Module '{module_name}' not found in /module folder.")
+            print(f"[!] JS Module '{module_name}' not found in /engine folder.")
             return
         
         # Suppress Node.js warnings
@@ -67,9 +67,9 @@ async def run_module(module_name: str):
 
     # 2. Otherwise, treat as Python module
     try:
-        mod = importlib.import_module(f"module.{module_name}")
+        mod = importlib.import_module(f"engine.{module_name}")
     except ModuleNotFoundError:
-        print(f"[!] Python Module '{module_name}' not found in /module folder.")
+        print(f"[!] Python Module '{module_name}' not found in /engine folder.")
         return
 
     if hasattr(mod, "run"):

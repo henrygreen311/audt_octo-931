@@ -109,7 +109,6 @@ const CFG = {
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
 };
 
-// Accounts tried per run for a track whose daily cap is `cap` (50 for 100/day, 5 for 10/day).
 const attemptsPerRun = cap => Math.ceil(cap / CFG.runsPerDay);
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -225,9 +224,6 @@ async function readUpTracks(sb) {
   return data && data[0] ? data[0].up_tracks : null;
 }
 
-// up_tracks = { week_start, days: [ { date, address, handle, track_id, status, ... } ] }
-// Returns today's successful tracks first (cap 100/day), then earlier successful tracks of the
-// stored week, newest first (cap 10/day).
 function collectTracks(upTracks, today) {
   const days = isObj(upTracks) && Array.isArray(upTracks.days) ? upTracks.days : [];
   const seen = new Map();
@@ -400,9 +396,6 @@ function makeSdk(acct) {
   });
 }
 
-// Favorite state of one track for one account.
-//  1) sdk.tracks.getTrack({ trackId, userId }) -> data.hasCurrentUserSaved (boolean, "does current user favorite")
-//  2) fallback: sdk.users.getFavorites({ id: userId }) and look for the track among favorite items
 async function isFavorited(sdk, userId, trackId) {
   const res = await readRetry(() => sdk.tracks.getTrack({ trackId, userId }));
   const d = res && res.data;
@@ -466,7 +459,6 @@ async function favoriteJob(sb, ctx, run, acct, target) {
         await withTimeout(sdk.tracks.favoriteTrack({ userId: acct.user_id, trackId: target.id }), CFG.callTimeoutMs, 'favoriteTrack');
       } catch (e) {
         if (isRateLimit(e)) throw e;
-        // not trusted either way: success is decided only by verification below
         run.lastReqErr = e;
       }
       if (!(await verifyFavorite(sdk, acct.user_id, target.id))) {
@@ -479,7 +471,7 @@ async function favoriteJob(sb, ctx, run, acct, target) {
     already ? st.already++ : st.ok++;
   } catch (e) {
     const kind = classify(e);
-    if (kind === 'rate') { outcome = 'rate'; st.rate++; log(`[!] ${who} -> track ${target.id} | 429 rate-limited; skipped, next run may retry.`); }
+    if (kind === 'rate') { outcome = 'rate'; st.rate++; say('429'); }
     else if (kind === 'permanent') { outcome = 'perm'; st.perm++; run.cool.add(acct.address); say(reason(e)); }
     else { outcome = 'retry'; st.retry++; say(reason(e)); }
     if (++run.consecFail >= CFG.failStopAfter && !run.stop) {
@@ -508,8 +500,6 @@ async function favoriteJob(sb, ctx, run, acct, target) {
   return outcome;
 }
 
-// Tries up to `attempts` accounts (rate-limited/failed ones count as attempts and are not replaced),
-// stopping early once `maxOk` successes are reached.
 async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let got = 0;
   let inflight = 0;

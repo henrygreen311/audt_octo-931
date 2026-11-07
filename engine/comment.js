@@ -1,18 +1,6 @@
 #!/usr/bin/env node
 'use strict';
 
-/*
- * Required one-time SQL migration (run in Supabase SQL editor):
- *
- *   ALTER TABLE public.audius
- *   ADD COLUMN IF NOT EXISTS repost JSONB NOT NULL DEFAULT '{"week_start": null, "runs": []}'::jsonb;
- *
- * Per-account "repost" column:
- *   { week_start, v, runs: [ { date, day, run_number, tracks: [ { track_id, status: 'success', reposted_at } ] } ] }
- * Coordinator row (TARGET_ADDRESS) additionally carries { batches: [...], lock: {...} } in its own "repost" column.
- * up_tracks and follower columns are never written by this script.
- */
-
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -100,13 +88,13 @@ for (const level of ['log', 'info', 'debug', 'warn']) {
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DB_FILE = path.join(ROOT_DIR, 'db.txt');
-const STATE_FILE = path.join(ROOT_DIR, '.audius_repost_state.json');
+const STATE_FILE = path.join(ROOT_DIR, '.audius_comment_state.json');
 const TARGET_ADDRESS = 'qringgreen@gmail.com';
 
 const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
-  dailyPerTrack: Number(process.env.DAILY_REPOSTS_PER_TRACK || 100),
-  dailyPerPreviousTrack: Number(process.env.DAILY_REPOSTS_PER_PREVIOUS_TRACK || 10),
+  dailyPerTrack: Number(process.env.DAILY_COMMENTS_PER_TRACK || 50),
+  dailyPerPreviousTrack: Number(process.env.DAILY_COMMENTS_PER_PREVIOUS_TRACK || 10),
   runsPerDay: 2,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
@@ -115,13 +103,14 @@ const CFG = {
   verifyTries: 3,
   verifyDelayMs: Number(process.env.VERIFY_DELAY_MS || 500),
   failStopAfter: Number(process.env.FAIL_STOP_AFTER || 20),
-  repostDelayMs: Number(process.env.REPOST_DELAY_MS || 100),
+  emojiShare: process.env.COMMENT_EMOJI_SHARE === undefined ? 0.3 : Number(process.env.COMMENT_EMOJI_SHARE),
+  scanPages: Number(process.env.COMMENT_SCAN_PAGES || 5),
+  commentDelayMs: Number(process.env.COMMENT_DELAY_MS || 100),
   concurrency: Number(process.env.CONCURRENCY || 5),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 20) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
 };
 
-// Accounts tried per run for a track whose daily cap is `cap` (50 for 100/day, 5 for 10/day).
 const attemptsPerRun = cap => Math.ceil(cap / CFG.runsPerDay);
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -214,11 +203,11 @@ async function fetchRows(sb) {
   const page = 1000;
   for (let from = 0; ; from += page) {
     const data = await withRetry(async () => {
-      const { data, error } = await sb.from('audius').select('address, handle, user_id, app_data, repost')
+      const { data, error } = await sb.from('audius').select('address, handle, user_id, app_data, comment')
         .order('address', { ascending: true }).range(from, from + page - 1);
       if (error) {
-        const e = new Error(/repost/i.test(error.message) && /column|exist|schema/i.test(error.message)
-          ? 'audius.repost column is missing - run the SQL migration first.' : error.message);
+        const e = new Error(/comment/i.test(error.message) && /column|exist|schema/i.test(error.message)
+          ? 'audius.comment column is missing - run the SQL migration first.' : error.message);
         e.fatal = true;
         throw e;
       }
@@ -237,9 +226,6 @@ async function readUpTracks(sb) {
   return data && data[0] ? data[0].up_tracks : null;
 }
 
-// up_tracks = { week_start, days: [ { date, address, handle, track_id, status, ... } ] }
-// Returns today's successful tracks first (cap 100/day), then earlier successful tracks of the
-// stored week, newest first (cap 10/day).
 function collectTracks(upTracks, today) {
   const days = isObj(upTracks) && Array.isArray(upTracks.days) ? upTracks.days : [];
   const seen = new Map();
@@ -252,20 +238,21 @@ function collectTracks(upTracks, today) {
     if (prev && !(isToday && prev.previous)) continue;
     seen.set(id, {
       id, key: id, address: d.address || null, handle: typeof d.handle === 'string' ? d.handle : null,
+      title: typeof d.published_title === 'string' && d.published_title.trim() ? d.published_title.trim().slice(0, 80) : null,
       date: d.date, previous: !isToday, cap: isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack,
     });
   }
   return [...seen.values()].sort((x, y) => (x.previous - y.previous) || (x.date < y.date ? 1 : x.date > y.date ? -1 : 0));
 }
 
-function normalizeRepost(raw, weekStart) {
+function normalizeComment(raw, weekStart) {
   if (isObj(raw) && raw.week_start === weekStart && Array.isArray(raw.runs)) return JSON.parse(JSON.stringify(raw));
   const h = { week_start: weekStart, runs: [] };
   if (isObj(raw) && raw.lock) h.lock = raw.lock;
   return h;
 }
 
-function repostedSet(raw, weekStart) {
+function commentedSet(raw, weekStart) {
   const s = new Set();
   if (isObj(raw) && raw.week_start === weekStart && Array.isArray(raw.runs)) {
     for (const r of raw.runs) for (const t of (r.tracks || [])) if (t.status === 'success') s.add(String(t.track_id));
@@ -275,26 +262,26 @@ function repostedSet(raw, weekStart) {
 
 let HELD_LOCK = null;
 
-async function updateRepost(sb, address, weekStart, mutate) {
+async function updateComment(sb, address, weekStart, mutate) {
   let lastErr;
   for (let attempt = 1; attempt <= 8; attempt++) {
     try {
-      const { data, error } = await sb.from('audius').select('address, repost').eq('address', address).limit(1);
+      const { data, error } = await sb.from('audius').select('address, comment').eq('address', address).limit(1);
       if (error) throw new Error(error.message);
       if (!data || !data[0]) throw Object.assign(new Error(`account row not found: ${address}`), { fatal: true });
-      const raw = data[0].repost;
-      const hist = normalizeRepost(raw, weekStart);
+      const raw = data[0].comment;
+      const hist = normalizeComment(raw, weekStart);
       if (address === TARGET_ADDRESS && HELD_LOCK && !(hist.lock && hist.lock.token === HELD_LOCK.token)) {
         throw new LockLostError('batch lock was taken over by another run');
       }
       if (mutate(hist) === false) return hist;
       const prevV = isObj(raw) && Number.isInteger(raw.v) ? raw.v : null;
       hist.v = (prevV || 0) + 1;
-      let q = sb.from('audius').update({ repost: hist }).eq('address', address);
-      q = prevV === null ? q.is('repost->>v', null) : q.eq('repost->>v', String(prevV));
-      const res = await q.select('address, repost');
+      let q = sb.from('audius').update({ comment: hist }).eq('address', address);
+      q = prevV === null ? q.is('comment->>v', null) : q.eq('comment->>v', String(prevV));
+      const res = await q.select('address, comment');
       if (res.error) throw new Error(res.error.message);
-      if (res.data && res.data.length === 1) return normalizeRepost(res.data[0].repost, weekStart);
+      if (res.data && res.data.length === 1) return normalizeComment(res.data[0].comment, weekStart);
       lastErr = new Error(`update conflict for ${address}`);
       await sleep(100 + Math.random() * 300);
     } catch (e) {
@@ -306,14 +293,14 @@ async function updateRepost(sb, address, weekStart, mutate) {
   throw lastErr;
 }
 
-async function recordRepost(sb, weekStart, address, f) {
+async function recordComment(sb, weekStart, address, f) {
   const key = String(f.track_id);
   const has = h => h.runs.some(r => (r.tracks || []).some(t => String(t.track_id) === key && t.status === 'success'));
-  const stored = await updateRepost(sb, address, weekStart, h => {
+  const stored = await updateComment(sb, address, weekStart, h => {
     if (has(h)) return false;
     let run = h.runs.find(r => r.date === f.date && r.run_number === f.run_number);
     if (!run) { run = { date: f.date, day: f.day, run_number: f.run_number, tracks: [] }; h.runs.push(run); }
-    run.tracks.push({ track_id: key, status: 'success', reposted_at: f.at });
+    run.tracks.push({ track_id: key, status: 'success', commented_at: f.at, ...(f.comment_id ? { comment_id: String(f.comment_id) } : {}) });
     return true;
   });
   if (!has(stored)) throw new Error(`database verification failed for ${address} -> ${key}`);
@@ -333,9 +320,9 @@ async function flushPending(sb, ctx) {
   const keep = [];
   for (const p of PENDING) {
     if (p.week_start !== ctx.weekStart) continue;
-    try { await recordRepost(sb, ctx.weekStart, p.address, p); } catch (_) { keep.push(p); }
+    try { await recordComment(sb, ctx.weekStart, p.address, p); } catch (_) { keep.push(p); }
   }
-  log(`[*] Recovered ${PENDING.length - keep.length}/${PENDING.length} unsaved reposts.`);
+  log(`[*] Recovered ${PENDING.length - keep.length}/${PENDING.length} unsaved comments.`);
   PENDING = keep;
   savePending();
 }
@@ -353,7 +340,7 @@ function lockStaleReason(lock) {
 async function acquireLock(sb, ctx) {
   const token = crypto.randomUUID();
   let blocked = null;
-  await updateRepost(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+  await updateComment(sb, TARGET_ADDRESS, ctx.weekStart, h => {
     blocked = null;
     if (h.lock && h.lock.token) {
       const why = lockStaleReason(h.lock);
@@ -378,7 +365,7 @@ function startHeartbeat(sb, ctx) {
     if (busy || LOCK_LOST) return;
     busy = true;
     try {
-      await updateRepost(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+      await updateComment(sb, TARGET_ADDRESS, ctx.weekStart, h => {
         h.lock.beat = new Date().toISOString();
         h.lock.expires_at = new Date(Date.now() + CFG.lockTtlMs).toISOString();
         return true;
@@ -392,7 +379,7 @@ function startHeartbeat(sb, ctx) {
 async function releaseLock(sb, ctx, lock) {
   if (!lock) return;
   try {
-    await updateRepost(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+    await updateComment(sb, TARGET_ADDRESS, ctx.weekStart, h => {
       if (!h.lock || h.lock.token !== lock.token) return false;
       delete h.lock;
       return true;
@@ -412,31 +399,190 @@ function makeSdk(acct) {
   });
 }
 
-// Repost state of one track for one account.
-//  1) sdk.tracks.getTrack({ trackId, userId }) -> data.hasCurrentUserReposted (boolean)
-//  2) fallback: page through sdk.users.getReposts({ id: userId }) (items look like { itemType, item: { id } })
-async function isReposted(sdk, userId, trackId) {
-  const res = await readRetry(() => sdk.tracks.getTrack({ trackId, userId }));
-  const d = res && res.data;
-  if (!d || String(d.id) !== String(trackId)) throw Object.assign(new Error(`track ${trackId} not found`), { status: 404 });
-  const flag = d.hasCurrentUserReposted !== undefined ? d.hasCurrentUserReposted : d.has_current_user_reposted;
-  if (typeof flag === 'boolean') return flag;
-  if (typeof sdk.users.getReposts !== 'function') throw new Error('cannot verify repost: SDK exposes no repost-state lookup');
-  for (let page = 0; page < 10; page++) {
-    const r = await readRetry(() => sdk.users.getReposts({ id: userId, limit: 100, offset: page * 100 }));
-    const list = (r && r.data) || [];
-    if (list.some(x => String(x.item && x.item.id !== undefined ? x.item.id : x.id) === String(trackId))) return true;
-    if (list.length < 100) break;
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const randInt = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+const an = w => (/^[aeiou]/i.test(w) ? 'an ' : 'a ') + w;
+
+const EMOJI = {
+  hearts: ['❤️', '🖤', '💜', '💙', '💚', '💛', '🧡', '🤍', '💖', '💗', '💓', '💞', '💘', '💝', '🩷', '🩵', '❤️‍🔥'],
+  fire: ['🔥', '💥', '⚡', '💫', '✨', '🌟', '🚀', '☄️', '🌋', '💣', '🎆', '🎇'],
+  faces: ['😍', '🥰', '🤩', '😎', '🤯', '🥹', '😭', '😮‍💨', '😌', '🥵', '🫠', '😏', '🤤', '😳', '🫶'],
+  music: ['🎧', '🎶', '🎵', '🎹', '🎸', '🥁', '🔊', '🎼', '🪩', '🕺', '💃', '🎤', '🎷', '🎺', '📻', '🎛️'],
+  hype: ['🙌', '👏', '🫡', '💪', '👌', '🤝', '🙏', '🫰', '🤘', '✊', '👊', '🙆'],
+  vibes: ['💎', '👑', '🏆', '💯', '🌊', '🌙', '🌈', '⭐', '🌌', '🪐', '🌆', '🌴', '🍃', '🦋', '🔮', '🧿', '🐐', '🥇'],
+};
+const EMOJI_FAMILIES = Object.keys(EMOJI);
+const EMOJI_ALL = [].concat(...Object.values(EMOJI));
+
+function emojiComment() {
+  const r = Math.random();
+  const fam = () => EMOJI[pick(EMOJI_FAMILIES)];
+  if (r < 0.34) return pick(EMOJI_ALL).repeat(randInt(2, 5));
+  if (r < 0.62) {
+    const f = shuffle(fam());
+    return f.slice(0, randInt(3, 5)).join('');
   }
-  return false;
+  if (r < 0.80) return pick(fam()).repeat(randInt(2, 3)) + pick(fam()).repeat(randInt(2, 3));
+  if (r < 0.92) return pick(fam()).repeat(randInt(2, 4)) + pick(['💯', '🔥', '🎧', '👑', '🙌', '🫶']).repeat(randInt(1, 2));
+  return `${pick(EMOJI.faces)}${pick(EMOJI.music)}${pick(EMOJI.fire)}${pick(EMOJI.hearts)}`;
 }
 
-async function verifyRepost(sdk, userId, trackId) {
+const CM = {
+  react: [
+    'absolutely insane', 'straight fire', 'pure heat', 'unreal', 'no way this is real', 'this is criminal', 'wow just wow',
+    'okay this is huge', 'instant favorite', 'goosebumps already', 'I cannot stop replaying this', 'what a monster',
+    'this one is special', 'big big big', 'we are not ready', 'this is dangerous', 'chills from the first second',
+    'hands down the best today', 'sheer perfection', 'immaculate', 'beyond words', 'this is next level', 'cold blooded',
+    'it just keeps getting better', 'I am speechless', 'certified heater', 'this one hits the soul', 'mind blown',
+    'this deserves a million plays', 'complete masterclass', 'this is world class', 'monster energy', 'pure magic',
+    'finally something real', 'this is the one', 'stop everything and listen', 'volume all the way up',
+    'crazy good', 'unbelievably clean', 'ridiculous in the best way', 'top tier', 'elite level', 'legendary stuff',
+    'this just made my day', 'I needed this', 'how is this not everywhere yet', 'the energy is unmatched',
+  ],
+  adj: [
+    'fire', 'insane', 'legendary', 'unreal', 'massive', 'electric', 'flawless', 'phenomenal', 'monstrous', 'immaculate',
+    'epic', 'ridiculous', 'cinematic', 'majestic', 'explosive', 'blistering', 'hypnotic', 'euphoric', 'colossal', 'savage',
+    'next level', 'otherworldly', 'spotless', 'sublime', 'radiant', 'lethal', 'untouchable', 'divine', 'bulletproof', 'luminous',
+    'razor sharp', 'face melting', 'earth shaking', 'heart stopping', 'jaw dropping', 'mind bending', 'soul shaking',
+    'breathtaking', 'thunderous', 'glorious', 'supreme', 'elite', 'dazzling', 'gripping', 'relentless', 'towering',
+    'spellbinding', 'transcendent', 'stellar', 'staggering', 'wicked', 'filthy', 'nasty', 'crisp', 'silky', 'velvety',
+    'monumental', 'heavenly', 'volcanic', 'cosmic', 'surreal', 'addictive', 'infectious', 'unstoppable', 'timeless',
+    'larger than life', 'top shelf', 'world class', 'studio perfect', 'club ready', 'festival ready', 'headphone worthy',
+    'chart worthy', 'powerful', 'mesmerizing', 'immersive', 'fearless', 'bold', 'gigantic', 'smooth as glass', 'razor clean',
+  ],
+  noun: [
+    'banger', 'masterpiece', 'anthem', 'heater', 'gem', 'monster', 'weapon', 'bomb', 'jam', 'vibe', 'track', 'release',
+    'production', 'journey', 'wave', 'groove', 'beast', 'tune', 'record', 'creation', 'sound', 'moment', 'experience',
+    'drop', 'build', 'rush', 'storm', 'classic', 'piece of art', 'sonic trip', 'earworm', 'riot', 'hit', 'mood',
+    'adventure', 'powerhouse', 'showstopper', 'game changer', 'flex', 'statement', 'ride', 'blast', 'jewel', 'lifesaver',
+  ],
+  verb: [
+    'slaps', 'hits different', 'goes crazy', 'goes so hard', 'goes off', 'hits so hard', 'delivers', 'never misses',
+    'keeps me hooked', 'gives me chills', 'sounds massive', 'sounds so clean', 'lives in my head', 'is stuck on repeat',
+    'grabs you instantly', 'lifts the whole room', 'wins every time', 'takes over', 'blows me away', 'knocks me out',
+    'moves the whole body', 'lights up my day', 'turns heads', 'does not miss', 'pulls you in', 'makes me feel alive',
+    'steals the show', 'runs the playlist', 'owns the night', 'melts me', 'rattles the speakers', 'shakes the walls',
+  ],
+  element: [
+    'that bass', 'the drop', 'that synth work', 'the kick', 'the melody', 'the build up', 'the low end', 'the groove', 'the hi-hat work',
+    'the lead', 'the arpeggio', 'the atmosphere', 'the mix', 'the sound design', 'the transition work', 'the rhythm', 'the texture design',
+    'the chord progression', 'the vocal work', 'the percussion', 'the sub', 'the energy', 'the pacing', 'the layering', 'the mastering',
+    'the stereo width', 'the snare', 'the break', 'the riser', 'the intro', 'the outro', 'the second half', 'the hook',
+    'that pad work', 'that drum work', 'the reverb work', 'the arrangement', 'the texture work', 'the bassline', 'the top end',
+  ],
+  elPraise: [
+    'is unreal', 'is nasty', 'is insane', 'is out of this world', 'is pure gold', 'is perfection', 'is so clean', 'is crazy',
+    'is lethal', 'is too good', 'is stunning', 'is huge', 'is something else', 'is on another level', 'hits so hard',
+    'goes crazy', 'sounds incredible', 'sounds massive', 'gives me chills', 'is dripping with energy', 'deserves an award',
+    'is perfectly crafted', 'is so satisfying', 'is flawless', 'is addicting', 'is breathtaking', 'is wild', 'is dangerous',
+  ],
+  feel: [
+    'chills', 'goosebumps', 'pure energy', 'good vibes only', 'all the feels', 'full focus', 'instant joy', 'a rush',
+    'total euphoria', 'serious momentum', 'real power', 'big confidence', 'fire in my chest', 'peace and power at once',
+  ],
+  where: [
+    'on a late night drive', 'in the headphones at full volume', 'in the gym', 'on the dance floor', 'through the car speakers',
+    'on a long walk', 'while working', 'at 3am', 'on a rooftop at night', 'in the club', 'on a road trip', 'at sunrise',
+  ],
+  closer: [
+    'Keep them coming!', 'More of this please.', 'Absolute respect.', 'Run it back.', 'Putting this on repeat.',
+    'Subscribed to the sound.', 'Sharing this everywhere.', 'This is going straight into my playlist.',
+    'Big support!', 'Massive respect.', 'Never stop creating.', 'The future is bright.', 'Take a bow.',
+    'Do not change a thing.', 'Do not sleep on this.', 'Everybody needs to hear this.', 'Loved every second.',
+    'Waiting for the next one.', 'Underrated no more.', 'Playing this again right now.', 'You nailed it.', 'Pure talent.',
+    'Easily one of the best I have heard.', 'This deserves way more plays.', 'Thank you for this one.',
+  ],
+};
+
+function textComment(title) {
+  const T = title ? `"${title}"` : null;
+  const makers = [
+    () => `${cap(pick(CM.react))}${pick(['!', '!!', '.'])} ${cap(pick(CM.element))} ${pick(CM.elPraise)}.`,
+    () => `This ${pick(CM.noun)} is ${pick(CM.adj)}${pick(['!', '.', '!!'])}`,
+    () => `${cap(pick(CM.adj))} ${pick(CM.noun)}. ${cap(pick(CM.element))} ${pick(CM.elPraise)}.`,
+    () => `${cap(pick(CM.element))} ${pick(CM.elPraise)} and ${pick(CM.element)} ${pick(CM.elPraise)}!`,
+    () => `${cap(pick(CM.react))}. ${pick(CM.closer)}`,
+    () => `${cap(an(pick(CM.adj)))} ${pick(CM.noun)} from start to finish. ${pick(CM.closer)}`,
+    () => `This ${pick(CM.verb)}. ${cap(pick(CM.element))} ${pick(CM.elPraise)}${pick(['!', '.'])}`,
+    () => `Giving me ${pick(CM.feel)} ${pick(CM.where)}. ${cap(pick(CM.adj))}!`,
+    () => `${cap(pick(CM.react))}${pick(['!', '.'])} Sounds ${pick(CM.adj)} ${pick(CM.where)}.`,
+    () => `${cap(pick(CM.adj))}, ${pick(CM.adj)} and ${pick(CM.adj)}. ${pick(CM.closer)}`,
+    () => `Not just ${an(pick(CM.noun))}, it is ${an(pick(CM.adj))} ${pick(CM.noun)}. ${cap(pick(CM.element))} ${pick(CM.elPraise)}.`,
+    () => `${cap(pick(CM.element))} ${pick(CM.elPraise)}${pick(['!', '.'])} ${cap(pick(CM.react))}.`,
+    () => `Straight up ${pick(CM.adj)}. ${cap(pick(CM.element))} ${pick(CM.verb)}.`,
+    () => `${cap(pick(CM.noun))} alert! ${cap(pick(CM.element))} ${pick(CM.elPraise)}.`,
+    () => `I keep coming back for ${pick(CM.element)}. ${cap(pick(CM.adj))} work.`,
+    () => `${cap(pick(CM.feel))} from the first second. ${pick(CM.closer)}`,
+    () => `${cap(pick(CM.react))}${pick(['!', '!!'])} ${cap(an(pick(CM.adj)))} ${pick(CM.noun)}.`,
+    () => `If you like ${pick(CM.adj)} sounds, this ${pick(CM.verb)}. ${pick(CM.closer)}`,
+    () => `${cap(pick(CM.element))} alone is worth the listen. ${cap(pick(CM.adj))}${pick(['!', '.'])}`,
+    () => `${cap(pick(CM.noun))} of the day. ${cap(pick(CM.element))} ${pick(CM.elPraise)}.`,
+  ];
+  if (T) {
+    makers.push(
+      () => `${T} ${pick(CM.verb)}${pick(['!', '.'])} ${cap(pick(CM.element))} ${pick(CM.elPraise)}.`,
+      () => `${T} is ${an(pick(CM.adj))} ${pick(CM.noun)}${pick(['!', '.'])} ${pick(CM.closer)}`,
+      () => `${cap(pick(CM.react))} - ${T}${pick(['!', '.'])}`,
+      () => `${T}: ${pick(CM.adj)}, ${pick(CM.adj)} and ${pick(CM.adj)}. ${cap(pick(CM.element))} ${pick(CM.elPraise)}.`,
+      () => `Played ${T} ${pick(CM.where)} and got ${pick(CM.feel)}. ${cap(pick(CM.adj))}!`,
+    );
+  }
+  let text = pick(makers)();
+  const r = Math.random();
+  if (r < 0.12) text = text.toLowerCase();
+  else if (r < 0.2) text = text.replace(/[.!]+$/, '');
+  if (Math.random() < 0.38) text += ` ${emojiBurst()}`;
+  return text;
+}
+
+function emojiBurst() {
+  const fam = EMOJI[pick(EMOJI_FAMILIES)];
+  return pick(fam).repeat(randInt(1, 3)) + (Math.random() < 0.4 ? pick(EMOJI_ALL) : '');
+}
+
+function generateComment(title) {
+  const share = Number.isFinite(CFG.emojiShare) ? CFG.emojiShare : 0.3;
+  const text = Math.random() < share ? emojiComment() : textComment(title);
+  return text.slice(0, 300);
+}
+
+function nextComment(run, target) {
+  let used = run.used.get(target.id);
+  if (!used) { used = new Set(); run.used.set(target.id, used); }
+  let text = generateComment(target.title);
+  for (let i = 0; i < 40 && used.has(text); i++) text = generateComment(target.title);
+  while (used.has(text)) text += pick(EMOJI_ALL);
+  used.add(text);
+  return text;
+}
+
+function entityIdOf(trackId) {
+  const H = sdkPkg.HashId || (sdkPkg.default && sdkPkg.default.HashId);
+  if (!H || typeof H.parse !== 'function') throw new Error('installed @audius/sdk does not export HashId; cannot decode track ids');
+  return H.parse(trackId);
+}
+const ENTITY_TRACK = (sdkPkg.EntityType && sdkPkg.EntityType.TRACK) || (sdkPkg.default && sdkPkg.default.EntityType && sdkPkg.default.EntityType.TRACK) || 'Track';
+
+async function findComment(sdk, userId, trackId, message) {
+  for (let page = 0; page < CFG.scanPages; page++) {
+    const r = await readRetry(() => sdk.tracks.getTrackComments({ trackId, userId, limit: 50, offset: page * 50, sortMethod: 'newest' }));
+    const list = (r && r.data) || [];
+    const hit = list.find(c => String(c.userId !== undefined ? c.userId : c.user_id) === String(userId) &&
+      (message == null || c.message === message));
+    if (hit) return hit;
+    if (list.length < 50) break;
+  }
+  return null;
+}
+
+async function verifyComment(sdk, userId, trackId, message) {
   for (let i = 1; i <= CFG.verifyTries; i++) {
     await sleep(CFG.verifyDelayMs * i);
-    if (await isReposted(sdk, userId, trackId)) return true;
+    const c = await findComment(sdk, userId, trackId, message);
+    if (c) return c;
   }
-  return false;
+  return null;
 }
 
 function tracksBelowCap(rows, published, ctx) {
@@ -445,7 +591,7 @@ function tracksBelowCap(rows, published, ctx) {
 }
 
 function allDoneMsg(n) {
-  return `[*] All ${n} tracks reached their daily repost limit. Exiting.`;
+  return `[*] All ${n} tracks reached their daily comment limit. Exiting.`;
 }
 
 function dayState(coord, today) {
@@ -465,29 +611,38 @@ function reason(e) {
   return m.slice(0, 50);
 }
 
-async function repostJob(sb, ctx, run, acct, target) {
+async function commentJob(sb, ctx, run, acct, target) {
   const st = run.stats;
   const who = acct.handle ? `@${acct.handle}` : acct.address;
   const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id} | ${text}`); };
   let verified = false;
   let already = false;
+  let commentId = null;
   let outcome;
   try {
     let sdk = run.sdks.get(acct.address);
     if (!sdk) { sdk = makeSdk(acct); run.sdks.set(acct.address, sdk); }
 
-    already = await isReposted(sdk, acct.user_id, target.id);
-    if (!already) {
+    const existing = await findComment(sdk, acct.user_id, target.id, null);
+    if (existing) {
+      already = true;
+      commentId = existing.id || null;
+    } else {
+      const body = nextComment(run, target);
+      let reqErr = null;
       try {
-        await withTimeout(sdk.tracks.repostTrack({ userId: acct.user_id, trackId: target.id }), CFG.callTimeoutMs, 'repostTrack');
+        await withTimeout(sdk.comments.createComment({
+          userId: acct.user_id,
+          metadata: { entityId: entityIdOf(target.id), entityType: ENTITY_TRACK, body },
+        }), CFG.callTimeoutMs, 'createComment');
       } catch (e) {
         if (isRateLimit(e)) throw e;
-        // not trusted either way: success is decided only by verification below
-        run.lastReqErr = e;
+        reqErr = e;
       }
-      if (!(await verifyRepost(sdk, acct.user_id, target.id))) {
-        throw run.lastReqErr || new Error('repost could not be verified');
-      }
+      const found = await verifyComment(sdk, acct.user_id, target.id, body);
+      if (!found) throw reqErr || new Error('comment could not be verified');
+      commentId = found.id || null;
+      say(body);
     }
     verified = true;
     run.consecFail = 0;
@@ -495,7 +650,7 @@ async function repostJob(sb, ctx, run, acct, target) {
     already ? st.already++ : st.ok++;
   } catch (e) {
     const kind = classify(e);
-    if (kind === 'rate') { outcome = 'rate'; st.rate++; log(`[!] ${who} -> track ${target.id} | 429 rate-limited; skipped, next run may retry.`); }
+    if (kind === 'rate') { outcome = 'rate'; st.rate++; say('429'); }
     else if (kind === 'permanent') { outcome = 'perm'; st.perm++; run.cool.add(acct.address); say(reason(e)); }
     else { outcome = 'retry'; st.retry++; say(reason(e)); }
     if (++run.consecFail >= CFG.failStopAfter && !run.stop) {
@@ -503,29 +658,26 @@ async function repostJob(sb, ctx, run, acct, target) {
       log('[!] Too many failures in a row; stopping. Next run resumes.');
     }
   }
-  run.lastReqErr = null;
   if (verified) {
     const item = {
-      address: acct.address, track_id: target.id, date: ctx.today, day: ctx.dayName, run_number: run.number,
+      address: acct.address, track_id: target.id, comment_id: commentId, date: ctx.today, day: ctx.dayName, run_number: run.number,
       week_start: ctx.weekStart, at: new Date().toISOString(),
     };
     let saved = true;
-    try { await recordRepost(sb, ctx.weekStart, acct.address, item); } catch (e) {
+    try { await recordComment(sb, ctx.weekStart, acct.address, item); } catch (e) {
       saved = false;
       PENDING.push(item); savePending();
       if (e instanceof LockLostError) run.abort = e;
     }
-    acct.reposted.add(target.key);
+    acct.commented.add(target.key);
     acct.today++;
-    if (!saved) log(`[!] ${who} -> track ${target.id} | reposted, DB save failed (kept locally)`);
-    else say(already ? 'already reposted' : 'successful');
+    if (!saved) log(`[!] ${who} -> track ${target.id} | commented, DB save failed (kept locally)`);
+    else say(already ? 'already commented' : 'successful');
   }
-  if (CFG.repostDelayMs) await sleep(CFG.repostDelayMs);
+  if (CFG.commentDelayMs) await sleep(CFG.commentDelayMs);
   return outcome;
 }
 
-// Tries up to `attempts` accounts (rate-limited/failed ones count as attempts and are not replaced),
-// stopping early once `maxOk` successes are reached.
 async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let got = 0;
   let inflight = 0;
@@ -547,7 +699,7 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
     if (!acct) return false;
     inflight++;
     started++;
-    const outcome = await repostJob(sb, ctx, run, acct, target);
+    const outcome = await commentJob(sb, ctx, run, acct, target);
     inflight--;
     if (outcome === 'ok' || outcome === 'already') got++;
     return true;
@@ -567,7 +719,7 @@ function countToday(raw, ctx) {
 function countTracks(rows, ctx, runNumber) {
   const counts = new Map();
   for (const r of rows) {
-    const f = r.repost;
+    const f = r.comment;
     if (!isObj(f) || f.week_start !== ctx.weekStart || !Array.isArray(f.runs)) continue;
     for (const x of f.runs) {
       if (x.date !== ctx.today || (runNumber !== undefined && x.run_number !== runNumber)) continue;
@@ -584,16 +736,20 @@ function countTracks(rows, ctx, runNumber) {
 async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   const accounts = rows.map(r => ({
     address: r.address, handle: typeof r.handle === 'string' ? r.handle.trim().replace(/^@/, '') : null,
-    user_id: r.user_id, app_data: r.app_data, hasCreds: hasCreds(r), reposted: repostedSet(r.repost, ctx.weekStart),
-    today: countToday(r.repost, ctx),
+    user_id: r.user_id, app_data: r.app_data, hasCreds: hasCreds(r), commented: commentedSet(r.comment, ctx.weekStart),
+    today: countToday(r.comment, ctx),
   }));
   const reader = accounts.find(a => a.hasCreds);
   if (!reader) throw new Error('no account with complete credentials');
   {
     const probe = makeSdk(reader);
-    if (!probe.tracks || typeof probe.tracks.repostTrack !== 'function') {
-      throw new Error('installed @audius/sdk has no tracks.repostTrack(); check the SDK version');
+    if (!probe.comments || typeof probe.comments.createComment !== 'function') {
+      throw new Error('installed @audius/sdk has no comments.createComment(); check the SDK version');
     }
+    if (!probe.tracks || typeof probe.tracks.getTrackComments !== 'function') {
+      throw new Error('installed @audius/sdk has no tracks.getTrackComments(); cannot verify comments');
+    }
+    entityIdOf(targets[0].id);
   }
 
   const targetAddrs = new Set(targets.map(p => p.address).filter(Boolean));
@@ -621,7 +777,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
       log(allDoneMsg(targets.length));
       return { status: 'ALREADY_COMPLETED' };
     }
-    await updateRepost(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+    await updateComment(sb, TARGET_ADDRESS, ctx.weekStart, h => {
       if (!h.batches) h.batches = [];
       const b = h.batches.find(x => x.date === ctx.today && x.run_number === runNumber);
       if (b && b.done) return false;
@@ -632,10 +788,10 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     return { status: 'COMPLETED' };
   }
   const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
-  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do (${active - activePrev} today, ${activePrev} previous days)${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} reposts.`);
+  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do (${active - activePrev} today, ${activePrev} previous days)${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} comments.`);
 
   if (!batch) {
-    await updateRepost(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+    await updateComment(sb, TARGET_ADDRESS, ctx.weekStart, h => {
       if (!h.batches) h.batches = [];
       if (h.batches.some(b => b.date === ctx.today && b.run_number === runNumber)) return false;
       h.batches.push({ date: ctx.today, run_number: runNumber, done: false });
@@ -643,7 +799,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     });
   }
 
-  const run = { startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, sdks: new Map(), stats: { ok: 0, already: 0, rate: 0, retry: 0, perm: 0 } };
+  const run = { startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, sdks: new Map(), used: new Map(), stats: { ok: 0, already: 0, rate: 0, retry: 0, perm: 0 } };
   const st = run.stats;
   let incomplete = false;
 
@@ -651,7 +807,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const n = need.get(t.key);
     if (!n.attempts) continue;
     if (run.stop) { incomplete = true; continue; }
-    const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !a.reposted.has(t.key) && !run.cool.has(a.address));
+    const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !a.commented.has(t.key) && !run.cool.has(a.address));
     const candidates = shuffle(pool).sort((x, y) => x.today - y.today);
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
@@ -667,15 +823,15 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
 
   const left = incomplete;
   if (!left) {
-    await updateRepost(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+    await updateComment(sb, TARGET_ADDRESS, ctx.weekStart, h => {
       const b = (h.batches || []).find(x => x.date === ctx.today && x.run_number === runNumber);
       if (!b || b.done) return false;
       b.done = true;
       return true;
     });
   }
-  const parts = [`${st.ok} reposted`];
-  if (st.already) parts.push(`${st.already} already reposted`);
+  const parts = [`${st.ok} commented`];
+  if (st.already) parts.push(`${st.already} already commented`);
   if (st.rate) parts.push(`${st.rate} rate-limited`);
   if (st.retry) parts.push(`${st.retry} errors`);
   if (st.perm) parts.push(`${st.perm} failed`);
@@ -683,7 +839,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   return { status: left ? 'INCOMPLETE' : 'COMPLETED' };
 }
 
-async function runRepost({ now = new Date() } = {}) {
+async function runComment({ now = new Date() } = {}) {
   const ctx = buildContext(now);
   const sb = connectSupabase();
   PENDING = loadPending();
@@ -696,7 +852,7 @@ async function runRepost({ now = new Date() } = {}) {
   if (!published.some(t => !t.previous)) log('[*] No tracks published today; using previous days only.');
 
   let rows = await fetchRows(sb);
-  const coordRaw = rows.find(r => r.address === TARGET_ADDRESS).repost;
+  const coordRaw = rows.find(r => r.address === TARGET_ADDRESS).comment;
   if (isObj(coordRaw) && coordRaw.week_start && coordRaw.week_start !== ctx.weekStart) {
     log('[*] New week: history reset.');
   }
@@ -704,7 +860,7 @@ async function runRepost({ now = new Date() } = {}) {
     log(allDoneMsg(published.length));
     return { status: 'ALREADY_COMPLETED' };
   }
-  if (!dayState(normalizeRepost(coordRaw, ctx.weekStart), ctx.today)) {
+  if (!dayState(normalizeComment(coordRaw, ctx.weekStart), ctx.today)) {
     log('[*] Both runs already done today. Exiting.');
     return { status: 'ALREADY_COMPLETED' };
   }
@@ -718,7 +874,7 @@ async function runRepost({ now = new Date() } = {}) {
   try {
     await flushPending(sb, ctx);
     rows = await fetchRows(sb);
-    const coord = normalizeRepost(rows.find(r => r.address === TARGET_ADDRESS).repost, ctx.weekStart);
+    const coord = normalizeComment(rows.find(r => r.address === TARGET_ADDRESS).comment, ctx.weekStart);
     if (!tracksBelowCap(rows, published, ctx).length) {
       log(allDoneMsg(published.length));
       return { status: 'ALREADY_COMPLETED' };
@@ -737,10 +893,10 @@ async function runRepost({ now = new Date() } = {}) {
 }
 
 if (require.main === module) {
-  runRepost().catch(err => {
+  runComment().catch(err => {
     console.error('[!] Fatal error:', err.message || err);
     process.exit(1);
   });
 }
 
-module.exports = { runRepost, collectTracks, buildContext, CFG };
+module.exports = { runComment, collectTracks, buildContext, CFG };
