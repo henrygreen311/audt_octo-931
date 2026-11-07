@@ -4,6 +4,7 @@
 /**
  * module/follower.js - two daily batches of 50 follower accounts that follow today's
  * published Audius handles (read from audius.up_tracks, never written).
+ * Jobs run strictly one at a time: one account follows one handle, then the next.
  *
  * Storage (audius.follower, jsonb):
  *   every follower account : { week_start, runs: [ { date, day, run_number, targets: [ { handle, followed_at } ] } ], v }
@@ -58,13 +59,14 @@ const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
   accountsPerRun: 50,
   runsPerDay: 2,
-  concurrency: 5, // hard cap on simultaneous follow jobs
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000, // no heartbeat for this long => owner is dead
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
   retryBaseMs: Number(process.env.RETRY_BASE_MS || 2000),
-  verifyTries: 4,
-  verifyDelayMs: Number(process.env.VERIFY_DELAY_MS || 2500),
+  verifyTries: 3,
+  verifyDelayMs: Number(process.env.VERIFY_DELAY_MS || 1500),
+  ratePauseMs: Number(process.env.RATE_PAUSE_MS || 15000), // pause after each 429
+  rateStopAfter: Number(process.env.RATE_STOP_AFTER || 10), // this many 429s in a row => stop, resume next run
   followDelayMs: Number(process.env.FOLLOW_DELAY_MS || 300),
   scanPages: Number(process.env.FOLLOWING_SCAN_PAGES || 10), // fallback check: pages of 100 followings
 };
@@ -121,18 +123,6 @@ async function withRetry(fn, retryIf = isTransient, tries = CFG.retries) {
   throw lastErr;
 }
 const readRetry = fn => withRetry(fn, e => !isRateLimit(e) && isTransient(e)); // 429 is never retried
-
-// Fixed-size worker pool: never more than `limit` workers (= jobs) running at once.
-async function runPool(items, limit, worker) {
-  let next = 0;
-  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const item = items[next++];
-      try { await worker(item); } catch (_) { /* workers handle their own errors */ }
-    }
-  });
-  await Promise.all(lanes);
-}
 
 // ---------------------------------------------------------------------------
 // Date / week helpers (identical logic to upload_track.js: Saturday-based week)
@@ -455,10 +445,17 @@ function dayState(coord, today) {
 // ---------------------------------------------------------------------------
 // One follow job = one follower account + one target handle
 // ---------------------------------------------------------------------------
+// followUser() parameter names differ between SDK versions (the installed one demands "id").
+// Both layouts below are tried on the first follow; the one whose follow is verified is kept.
+const FOLLOW_STYLES = [
+  (f, t) => ({ id: t, userId: f, followeeUserId: t }), // id = the user being followed
+  (f, t) => ({ id: f, userId: f, followeeUserId: t }), // id = the user doing the following
+];
+
 async function followJob(sb, ctx, run, acct, target) {
   const st = run.stats;
   if (run.abort || LOCK_LOST) return;
-  if (run.cool.has(acct.address)) { st.retry++; return; } // rate-limited earlier: leave for the next run
+  if (run.stop || run.cool.has(acct.address)) { st.retry++; return; } // left for the next run
   const label = acct.handle || acct.address;
   let verified = false;
   try {
@@ -466,23 +463,38 @@ async function followJob(sb, ctx, run, acct, target) {
     if (!sdk) { sdk = makeSdk(acct); run.sdks.set(acct.address, sdk); }
 
     // Already following (e.g. a follow whose save failed earlier)? Then never follow again, just record it.
-    let already = await isFollowing(sdk, acct.user_id, target.id);
+    const already = await isFollowing(sdk, acct.user_id, target.id);
     if (!already) {
-      let followErr = null;
-      try { await sdk.users.followUser({ userId: acct.user_id, followeeUserId: target.id }); } catch (e) {
-        if (isRateLimit(e)) throw e;
-        followErr = e; // may still have landed: verify below
+      let lastErr = null;
+      for (const i of run.style === null ? [0, 1] : [run.style]) {
+        lastErr = null;
+        try { await sdk.users.followUser(FOLLOW_STYLES[i](acct.user_id, target.id)); } catch (e) {
+          if (isRateLimit(e)) throw e;
+          lastErr = e; // may still have landed: verify below
+          if (!statusOf(e) && /required parameter|invalid/i.test(String(e.message))) continue; // rejected before sending
+        }
+        if (await verifyFollow(sdk, acct.user_id, target.id)) {
+          if (run.style === null) { run.style = i; log(`[*] followUser parameter layout #${i + 1} works.`); }
+          lastErr = null;
+          verified = true;
+          break;
+        }
       }
-      if (!(await verifyFollow(sdk, acct.user_id, target.id))) throw followErr || new Error('follow could not be verified');
+      if (!verified) throw lastErr || new Error('follow could not be verified');
     }
     verified = true;
     already ? st.already++ : st.ok++;
+    run.consecRate = 0;
   } catch (e) {
     const kind = classify(e);
     if (kind === 'rate') {
       run.cool.add(acct.address);
       st.rate++;
       log(`[!] Rate limit encountered: ${label} -> ${target.handle}. Skipping for now.`);
+      if (++run.consecRate >= CFG.rateStopAfter && !run.stop) {
+        run.stop = true;
+        log(`[!] ${run.consecRate} rate limits in a row; stopping this run early. The next execution resumes it.`);
+      } else if (CFG.ratePauseMs) await sleep(CFG.ratePauseMs); // back off instead of hammering Audius
     } else {
       st[kind === 'permanent' ? 'perm' : 'retry']++;
       if (st.logged++ < 10) log(`[!] ${label} -> ${target.handle}: ${errMsg(e)}`);
@@ -536,7 +548,7 @@ async function processRun(sb, ctx, rows, published, coord, { runNumber, batch })
     });
   }
 
-  const run = { number: runNumber, cool: new Set(), abort: null, sdks: new Map(), stats: { ok: 0, already: 0, rate: 0, retry: 0, perm: 0, logged: 0 } };
+  const run = { number: runNumber, cool: new Set(), abort: null, stop: false, style: null, consecRate: 0, sdks: new Map(), stats: { ok: 0, already: 0, rate: 0, retry: 0, perm: 0, logged: 0 } };
   const st = run.stats;
 
   // One handle at a time: every selected account follows handle #1, then handle #2, ... (spreads the load).
@@ -544,7 +556,10 @@ async function processRun(sb, ctx, rows, published, coord, { runNumber, batch })
     const todo = members.filter(a => !a.followed.has(t.key));
     if (!todo.length) continue;
     const before = st.ok + st.already;
-    await runPool(todo, CFG.concurrency, a => followJob(sb, ctx, run, a, t));
+    for (const a of todo) {
+      if (run.abort || LOCK_LOST) break;
+      await followJob(sb, ctx, run, a, t); // strictly sequential
+    }
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     log(`[*] @${t.handle}: ${st.ok + st.already - before}/${todo.length} followed.`);
   }
@@ -620,4 +635,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runFollower, todaysHandles, buildContext };
+module.exports = { runFollower, todaysHandles, buildContext, CFG };
