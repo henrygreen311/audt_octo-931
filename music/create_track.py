@@ -13,7 +13,7 @@ import uuid
 import httpx
 from supabase import create_client
 
-# Local imports
+# Since both files are in the same folder, import directly
 from tracks_dl import download_track, load_supabase_creds
 from login import login_and_update_cookie
 
@@ -62,7 +62,8 @@ TEMPOS = [
 def get_cookie(supabase) -> str:
     res = supabase.table("audius").select("ms_cookie").eq("address", TARGET_ADDRESS).execute()
     if not res.data or not res.data[0].get("ms_cookie"):
-        sys.exit("[!] No cookie found for target address.")
+        print("[!] No cookie found for target address.")
+        return None
     return res.data[0]["ms_cookie"]
 
 
@@ -70,17 +71,22 @@ def get_gemini_keys() -> list[str]:
     print("[*] Fetching Gemini API keys...")
     try:
         with httpx.Client() as client:
-            resp = client.get(GEMINI_KEY_URL, timeout=10.0)
+            resp = client.get(GEMINI_KEY_URL, timeout=15.0)
             resp.raise_for_status()
             keys = [k.strip() for k in resp.text.splitlines() if k.strip().startswith("AQ.")]
             if not keys:
-                sys.exit("[!] No valid Gemini keys found in response.")
+                print("[!] No valid Gemini keys found in response.")
+                return []
             return keys
     except Exception as e:
-        sys.exit(f"[!] Failed to fetch Gemini keys: {e}")
+        print(f"[!] Failed to fetch Gemini keys: {e}")
+        return []
 
 
 def generate_prompt_with_gemini(keys: list[str]) -> str:
+    if not keys:
+        return None
+
     random.shuffle(keys)
 
     mood = random.choice(MOODS)
@@ -99,35 +105,57 @@ def generate_prompt_with_gemini(keys: list[str]) -> str:
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
     payload = {"contents": [{"parts": [{"text": instruction}]}]}
 
-    for key in keys:
-        try:
-            with httpx.Client() as client:
-                headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-                resp = client.post(url, headers=headers, json=payload, timeout=20.0)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    # 3 full passes through the available keys
+    for attempt in range(1, 4):
+        for key in keys:
+            try:
+                with httpx.Client() as client:
+                    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+                    # Increased timeout to 45s to prevent read timeouts
+                    resp = client.post(url, headers=headers, json=payload, timeout=45.0)
                     
-                    if "english" not in text.lower():
-                        text += " English lyrics only."
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                         
-                    print(f"[*] Gemini prompt generated: {text[:80]}...")
-                    return text
-                else:
-                    print(f"[!] Gemini key failed (HTTP {resp.status_code}): {resp.text[:150]}. Trying next...")
-        except Exception as e:
-            print(f"[!] Gemini request error: {e}. Trying next...")
+                        if "english" not in text.lower():
+                            text += " English lyrics only."
+                            
+                        print(f"[*] Gemini prompt generated: {text[:80]}...")
+                        return text
+                    else:
+                        print(f"[!] Attempt {attempt}/3 - Gemini key failed (HTTP {resp.status_code}): {resp.text[:100]}. Trying next...")
+            except httpx.TimeoutException:
+                print(f"[!] Attempt {attempt}/3 - Gemini request timed out. Trying next...")
+            except Exception as e:
+                print(f"[!] Attempt {attempt}/3 - Gemini request error: {e}. Trying next...")
+        
+        if attempt < 3:
+            print("[*] Waiting 5 seconds before retrying all keys...")
+            time.sleep(5)
 
-    sys.exit("[!] All Gemini keys failed.")
+    print("[!] All Gemini keys failed after 3 attempts.")
+    return None
 
 
 def create_track():
     url, key = load_supabase_creds()
     supabase = create_client(url, key)
+    
     cookie = get_cookie(supabase)
+    if not cookie:
+        print("[!] Aborting: No cookie available. Run login.py first.")
+        return
 
     keys = get_gemini_keys()
+    if not keys:
+        print("[!] Aborting: No Gemini keys available.")
+        return
+
     prompt = generate_prompt_with_gemini(keys)
+    if not prompt:
+        print("[!] Aborting: Could not generate a prompt.")
+        return
 
     print("[*] Sending generation request to AceMusic...")
     now_ms = int(time.time() * 1000)
@@ -158,7 +186,7 @@ def create_track():
 
         try:
             with httpx.Client() as client:
-                resp = client.post(api_url, headers=headers, json=payload, timeout=20.0)
+                resp = client.post(api_url, headers=headers, json=payload, timeout=30.0)
                 
                 if resp.status_code == 401:
                     print(f"[!] Unauthorized (401) on attempt {attempt}/{max_retries}. Session expired.")
@@ -170,7 +198,7 @@ def create_track():
                         continue # Retry the loop with the new cookie
                     else:
                         print("[!] Failed to refresh cookie. Aborting.")
-                        sys.exit(1)
+                        return
                         
                 resp.raise_for_status()
                 data = resp.json()
@@ -182,20 +210,20 @@ def create_track():
                     print(f"\n[+] Track creation queued! (Task ID: {task_id})")
                     ok = download_track(supabase, task_id)
                     if not ok:
-                        sys.exit(1)
+                        print("[!] Track download failed.")
                     return # Success! Exit the function.
                 else:
                     print("[!] Unexpected response format. No task_id found.")
                     print(data)
-                    sys.exit(1)
+                    return
 
         except httpx.HTTPStatusError as e:
             print(f"[!] HTTP Error {e.response.status_code}: {e.response.text[:150]}")
             if attempt >= max_retries:
-                sys.exit(1)
+                return
         except Exception as e:
             print(f"[!] Failed to create track: {e}")
-            sys.exit(1)
+            return
 
 
 if __name__ == "__main__":
