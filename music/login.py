@@ -18,7 +18,7 @@ DB_FILE    = ROOT_DIR / "db.txt"
 TARGET_ADDRESS = "qringgreen@gmail.com"
 
 # The base cookie template from your browser.
-# We will inject the new ace_at and ace_rt tokens into this.
+# We will inject the new ace_at and ace_rt tokens into this using .replace()
 BASE_COOKIE = (
     "lang=en; "
     "CookieConsent={stamp:%27-1%27%2Cnecessary:true%2Cpreferences:true%2Cstatistics:true%2Cmarketing:true%2Cmethod:%27implied%27%2Cver:1%2Cutc:1793981545837%2Cregion:%27NG%27}; "
@@ -83,8 +83,8 @@ def login_and_update_cookie(email="sekob71533@macsnipe.com", password="Edmond99@
                 
             print(f"[*] Login successful. Extracted new tokens.")
             
-            # Build the full cookie
-            full_cookie = BASE_COOKIE.format(ace_at=ace_at, ace_rt=ace_rt)
+            # Build the full cookie using replace to avoid {} format conflicts
+            full_cookie = BASE_COOKIE.replace("{ace_at}", ace_at).replace("{ace_rt}", ace_rt)
             
             # Save to DB
             url, key = load_supabase_creds()
