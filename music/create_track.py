@@ -21,16 +21,12 @@ from login import login_and_update_cookie
 TARGET_ADDRESS = "qringgreen@gmail.com"
 GEMINI_KEY_URL = "https://gemini-api.qring99.workers.dev/"
 
-# ===============================================================
-# SETTING: Max tracks to generate per run (Max 20)
-# ===============================================================
-MAX_TRACKS = int(os.getenv("MAX_TRACKS", "20"))
+# SETTING: Max tracks to generate per run
+MAX_TRACKS = int(os.getenv("MAX_TRACKS", "3"))
 if MAX_TRACKS < 1: MAX_TRACKS = 1
 if MAX_TRACKS > 20: MAX_TRACKS = 20
 
-# ---------------------------------------------------------------
 # Word pools - large for maximum variety per generation
-# ---------------------------------------------------------------
 MOODS = [
     "romantic", "sad", "joyful", "melancholic", "dark", "energetic", "chill", "epic",
     "nostalgic", "dreamy", "uplifting", "intense", "playful", "hopeful", "mysterious",
