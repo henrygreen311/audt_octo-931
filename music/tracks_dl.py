@@ -15,6 +15,7 @@ from supabase import create_client
 SCRIPT_DIR = Path(__file__).resolve().parent      # .../music
 ROOT_DIR   = SCRIPT_DIR.parent                    # .../audius
 DB_FILE    = ROOT_DIR / "db.txt"
+IMAGES_DIR = SCRIPT_DIR / "images"
 
 TARGET_ADDRESS = "qringgreen@gmail.com"
 
@@ -58,10 +59,13 @@ def delete_track(client: httpx.Client, headers: dict, task_id: str, title: str =
 
 def download_track(supabase, task_id: str) -> bool:
     """
-    Polls AceMusic API until the local_audio URL appears, downloads the track, 
-    deletes it from the server, and cleans up any leftover/duplicate songs.
+    Polls AceMusic API until the local_audio URL appears, downloads the track and cover, 
+    deletes them from the server, and cleans up any leftover/duplicate songs.
     """
     cookie = get_latest_cookie(supabase)
+    
+    # Ensure images directory exists
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
     url = "https://acemusic.ai/api/songs?limit=30&sort=new&hide=rating%3Adisliked"
     headers = {
@@ -96,7 +100,7 @@ def download_track(supabase, task_id: str) -> bool:
                             return False
 
                         if song.get("local_audio"):
-                            print(f"[*] Task completed! Audio URL is ready.")
+                            print(f"[*] Task completed! Audio and Cover URLs are ready.")
                             ready = True
                             break
 
@@ -127,25 +131,49 @@ def download_track(supabase, task_id: str) -> bool:
                 return False
 
             audio_path = latest_song.get("local_audio")
+            cover_path = latest_song.get("local_cover")
             title = latest_song.get("meta", {}).get("title", "Untitled")
 
-            clean_path = audio_path.lstrip("/")
-            full_url = f"https://acemusic.ai/{clean_path}"
-
             safe_title = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-").lower()
-            filename = f"{safe_title}.mp3"
-            save_path = SCRIPT_DIR / filename
-
+            
             print(f"[*] Found latest song: '{title}'")
             print(f"[*] Downloading from song: '{title}'")
 
-            file_resp = client.get(full_url, headers=headers, timeout=60.0)
+            # 1. Download Audio
+            clean_audio_path = audio_path.lstrip("/")
+            full_audio_url = f"https://acemusic.ai/{clean_audio_path}"
+            audio_filename = f"{safe_title}.mp3"
+            audio_save_path = SCRIPT_DIR / audio_filename
+
+            file_resp = client.get(full_audio_url, headers=headers, timeout=60.0)
             file_resp.raise_for_status()
 
-            with open(save_path, "wb") as f:
+            with open(audio_save_path, "wb") as f:
                 f.write(file_resp.content)
 
-            print(f"[+] Successfully downloaded: {filename}")
+            print(f"[+] Successfully downloaded: {audio_filename}")
+
+            # 2. Download Cover (if available)
+            if cover_path:
+                try:
+                    # Strip query params like ?v=123456 from the path
+                    clean_cover_path = cover_path.lstrip("/").split("?")[0]
+                    full_cover_url = f"https://acemusic.ai/{clean_cover_path}"
+                    cover_filename = f"{safe_title}.jpg"
+                    cover_save_path = IMAGES_DIR / cover_filename
+
+                    cover_resp = client.get(full_cover_url, headers=headers, timeout=30.0)
+                    cover_resp.raise_for_status()
+
+                    with open(cover_save_path, "wb") as f:
+                        f.write(cover_resp.content)
+                        
+                    print(f"[+] Successfully downloaded cover: images/{cover_filename}")
+                except Exception as c_err:
+                    print(f"[!] Failed to download cover image: {c_err}")
+            else:
+                print("[*] No cover image URL found for this track.")
+
             downloaded = True
 
             # --- Delete the primary track from acemusic.ai ---
