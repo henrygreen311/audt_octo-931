@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-music/create_track.py - Generates a track using Gemini + AceMusic.
+music/create_track.py - Generates tracks using Gemini + AceMusic.
 Usage:
   python3 music/create_track.py
 """
 
+import os
 import random
 import sys
 import time
@@ -14,11 +15,18 @@ import httpx
 from supabase import create_client
 
 # Since both files are in the same folder, import directly
-from tracks_dl import download_track, load_supabase_creds
+from tracks_dl import download_tracks, load_supabase_creds
 from login import login_and_update_cookie
 
 TARGET_ADDRESS = "qringgreen@gmail.com"
 GEMINI_KEY_URL = "https://gemini-api.qring99.workers.dev/"
+
+# ===============================================================
+# SETTING: Max tracks to generate per run (Max 20)
+# ===============================================================
+MAX_TRACKS = int(os.getenv("MAX_TRACKS", "1"))
+if MAX_TRACKS < 1: MAX_TRACKS = 1
+if MAX_TRACKS > 20: MAX_TRACKS = 20
 
 # ---------------------------------------------------------------
 # Word pools - large for maximum variety per generation
@@ -74,71 +82,96 @@ def get_gemini_keys() -> list[str]:
             resp = client.get(GEMINI_KEY_URL, timeout=15.0)
             resp.raise_for_status()
             keys = [k.strip() for k in resp.text.splitlines() if k.strip().startswith("AQ.")]
-            if not keys:
-                print("[!] No valid Gemini keys found in response.")
-                return []
             return keys
     except Exception as e:
         print(f"[!] Failed to fetch Gemini keys: {e}")
         return []
 
 
-def generate_prompt_with_gemini(keys: list[str]) -> str:
-    if not keys:
-        return None
+def generate_prompts_with_gemini(keys: list[str], count: int) -> list[str]:
+    """Generates `count` prompts using a single batch request to Gemini."""
+    
+    # 1. Build the random seeds in Python
+    seeds = []
+    for _ in range(count):
+        mood = random.choice(MOODS)
+        voice = random.choice(VOICES)
+        genre = random.choice(GENRES)
+        tempo = random.choice(TEMPOS)
+        seeds.append(f"- {mood} {genre} track with {voice}, tempo {tempo}")
+    
+    seed_text = "\n".join(seeds)
 
-    random.shuffle(keys)
-
-    mood = random.choice(MOODS)
-    voice = random.choice(VOICES)
-    genre = random.choice(GENRES)
-    tempo = random.choice(TEMPOS)
-
+    # 2. Formulate the batch instruction
     instruction = (
-        f"Write a detailed, professional music generation prompt for an AI music model. "
-        f"The song should be a {mood} {genre} track with {voice}. "
-        f"Specify instrumentation, atmosphere, and tempo ({tempo}). "
-        f"CRITICAL: Explicitly state in the prompt that the lyrics and vocals MUST be in English. "
-        f"Output ONLY the prompt text, no introductory or concluding remarks."
+        f"You are an expert music producer. Expand the following {count} short ideas into {count} distinct, detailed music generation prompts for an AI music model. "
+        f"Each prompt must be a single paragraph describing instrumentation, atmosphere, and production style. "
+        f"CRITICAL: Explicitly state in EVERY prompt that the lyrics and vocals MUST be in English. "
+        f"Separate each prompt with the exact string '---PROMPT---'. "
+        f"Output ONLY the prompts and the separators, absolutely no other text. No numbering, no markdown.\n\n"
+        f"IDEAS:\n{seed_text}"
     )
 
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
     payload = {"contents": [{"parts": [{"text": instruction}]}]}
 
-    # 3 full passes through the available keys
+    if not keys:
+        return _fallback_prompts(count)
+
+    random.shuffle(keys)
+
     for attempt in range(1, 4):
         for key in keys:
             try:
                 with httpx.Client() as client:
                     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-                    # Increased timeout to 45s to prevent read timeouts
-                    resp = client.post(url, headers=headers, json=payload, timeout=45.0)
+                    resp = client.post(url, headers=headers, json=payload, timeout=60.0)
                     
                     if resp.status_code == 200:
                         data = resp.json()
-                        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                         
-                        if "english" not in text.lower():
-                            text += " English lyrics only."
-                            
-                        print(f"[*] Gemini prompt generated: {text[:80]}...")
-                        return text
+                        # Parse the response using the separator
+                        prompts = [p.strip() for p in raw_text.split("---PROMPT---") if p.strip()]
+                        
+                        if len(prompts) >= count:
+                            print(f"[*] Gemini successfully generated {len(prompts)} prompts.")
+                            return prompts[:count]
+                        else:
+                            print(f"[!] Gemini only returned {len(prompts)}/{count} prompts. Padding with fallback...")
+                            while len(prompts) < count:
+                                prompts.append(_fallback_prompts(1)[0])
+                            return prompts
                     else:
                         print(f"[!] Attempt {attempt}/3 - Gemini key failed (HTTP {resp.status_code}): {resp.text[:100]}. Trying next...")
-            except httpx.TimeoutException:
-                print(f"[!] Attempt {attempt}/3 - Gemini request timed out. Trying next...")
             except Exception as e:
-                print(f"[!] Attempt {attempt}/3 - Gemini request error: {e}. Trying next...")
+                print(f"[!] Attempt {attempt}/3 - Gemini error: {e}. Trying next...")
         
         if attempt < 3:
             print("[*] Waiting 5 seconds before retrying all keys...")
             time.sleep(5)
 
-    print("[!] All Gemini keys failed after 3 attempts.")
-    return None
+    print("[!] All Gemini keys failed. Using basic Python-generated fallback prompts.")
+    return _fallback_prompts(count)
 
 
-def create_track():
+def _fallback_prompts(count: int) -> list[str]:
+    """Python-generated prompts used if Gemini completely fails."""
+    prompts = []
+    for _ in range(count):
+        mood = random.choice(MOODS)
+        voice = random.choice(VOICES)
+        genre = random.choice(GENRES)
+        tempo = random.choice(TEMPOS)
+        prompts.append(
+            f"A {mood} {genre} track at a {tempo} tempo featuring {voice}. "
+            f"Professional studio production, polished mixing, and atmospheric instrumentation. "
+            f"English lyrics only."
+        )
+    return prompts
+
+
+def create_tracks():
     url, key = load_supabase_creds()
     supabase = create_client(url, key)
     
@@ -148,83 +181,92 @@ def create_track():
         return
 
     keys = get_gemini_keys()
-    if not keys:
-        print("[!] Aborting: No Gemini keys available.")
-        return
-
-    prompt = generate_prompt_with_gemini(keys)
-    if not prompt:
-        print("[!] Aborting: Could not generate a prompt.")
-        return
-
-    print("[*] Sending generation request to AceMusic...")
-    now_ms = int(time.time() * 1000)
-    attempt_id = str(uuid.uuid4())
-
+    
+    print(f"[*] Requesting {MAX_TRACKS} prompts from Gemini...")
+    prompts = generate_prompts_with_gemini(keys, MAX_TRACKS)
+    
+    print(f"[*] Planning to generate {MAX_TRACKS} track(s)...")
+    task_ids = []
     api_url = "https://acemusic.ai/api/idea"
-    payload = {
-        "prompt": prompt,
-        "created_at": now_ms,
-        "references": [],
-        "model": "ace-step-1.5-xl",
-        "analytics": {"attempt_id": attempt_id, "requested_model": "ace-step-1.5-xl"},
-        "media": [],
-    }
 
-    max_retries = 2
-    for attempt in range(1, max_retries + 1):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Referer": "https://acemusic.ai/create/",
-            "Origin": "https://acemusic.ai",
-            "Content-Type": "application/json",
-            "Cookie": cookie,
+    # 1. Send requests to AceMusic
+    for i, prompt in enumerate(prompts, 1):
+        print(f"\n--- [{i}/{MAX_TRACKS}] Sending request to AceMusic ---")
+        print(f"[*] Prompt: {prompt[:80]}...")
+        
+        now_ms = int(time.time() * 1000)
+        attempt_id = str(uuid.uuid4())
+
+        payload = {
+            "prompt": prompt,
+            "created_at": now_ms,
+            "references": [],
+            "model": "ace-step-1.5-xl",
+            "analytics": {"attempt_id": attempt_id, "requested_model": "ace-step-1.5-xl"},
+            "media": [],
         }
 
-        try:
-            with httpx.Client() as client:
-                resp = client.post(api_url, headers=headers, json=payload, timeout=30.0)
-                
-                if resp.status_code == 401:
-                    print(f"[!] Unauthorized (401) on attempt {attempt}/{max_retries}. Session expired.")
-                    print("[*] Attempting to log in and refresh cookie...")
+        max_retries = 2
+        success = False
+        
+        for attempt in range(1, max_retries + 1):
+            headers = {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Referer": "https://acemusic.ai/create/",
+                "Origin": "https://acemusic.ai",
+                "Content-Type": "application/json",
+                "Cookie": cookie,
+            }
+
+            try:
+                with httpx.Client() as client:
+                    resp = client.post(api_url, headers=headers, json=payload, timeout=30.0)
                     
-                    new_cookie = login_and_update_cookie()
-                    if new_cookie:
-                        cookie = new_cookie
-                        continue # Retry the loop with the new cookie
+                    if resp.status_code == 401:
+                        print(f"[!] Unauthorized (401). Session expired.")
+                        print("[*] Attempting to log in and refresh cookie...")
+                        new_cookie = login_and_update_cookie()
+                        if new_cookie:
+                            cookie = new_cookie
+                            continue
+                        else:
+                            print("[!] Failed to refresh cookie. Aborting.")
+                            return
+                            
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    song = data.get("song", {})
+                    task_id = song.get("task_id")
+
+                    if task_id:
+                        print(f"[+] Track queued! (Task ID: {task_id})")
+                        task_ids.append(task_id)
+                        success = True
+                        break
                     else:
-                        print("[!] Failed to refresh cookie. Aborting.")
-                        return
-                        
-                resp.raise_for_status()
-                data = resp.json()
+                        print("[!] Unexpected response format. No task_id found.")
 
-                song = data.get("song", {})
-                task_id = song.get("task_id")
+            except Exception as e:
+                print(f"[!] Failed to create track (attempt {attempt}): {e}")
+                
+            if attempt < max_retries:
+                time.sleep(3)
+                
+        if not success:
+            print(f"[!] Skipping track {i} due to repeated errors.")
 
-                if task_id:
-                    print(f"\n[+] Track creation queued! (Task ID: {task_id})")
-                    ok = download_track(supabase, task_id)
-                    if not ok:
-                        print("[!] Track download failed.")
-                    return # Success! Exit the function.
-                else:
-                    print("[!] Unexpected response format. No task_id found.")
-                    print(data)
-                    return
-
-        except httpx.HTTPStatusError as e:
-            print(f"[!] HTTP Error {e.response.status_code}: {e.response.text[:150]}")
-            if attempt >= max_retries:
-                return
-        except Exception as e:
-            print(f"[!] Failed to create track: {e}")
-            return
-
+    # 2. Download all generated tracks
+    if task_ids:
+        print(f"\n{'='*50}")
+        print(f"[*] All tasks queued. Passing {len(task_ids)} task ID(s) to downloader...")
+        print(f"{'='*50}\n")
+        download_tracks(supabase, task_ids)
+    else:
+        print("\n[!] No tracks were successfully queued.")
 
 if __name__ == "__main__":
-    create_track()
+    create_tracks()
