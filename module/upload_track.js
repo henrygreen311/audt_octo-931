@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const { execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -52,6 +53,8 @@ const CFG = {
   priorityHandles: ['qring', 'tradex', 'obi350965'],
   priorityPerWeek: 3,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
+  // A lock of unknown ownership with no data recorded for today is treated as stale after this long (0 = off).
+  lockIdleMs: Number(process.env.LOCK_IDLE_MINUTES ?? 10) * 60000,
   genTimeoutMs: Number(process.env.GEN_TIMEOUT_MINUTES || 60) * 60000,
   genTopUpAttempts: Number(process.env.GEN_TOPUP_ATTEMPTS ?? 1),
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
@@ -410,19 +413,52 @@ async function weeklyResetPass(sb, rows, ctx) {
 // ---------------------------------------------------------------------------
 class LockLostError extends Error {}
 
+// true = owner process is alive on this host, false = it is gone, null = cannot tell
+// (lock written by an older version without pid/host, or by another machine).
+function lockOwnerAlive(lock) {
+  if (!lock.pid || lock.host !== os.hostname()) return null;
+  try { process.kill(lock.pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+// Does the stored history hold ANY entry for today? ("days": [] => no.)
+function hasDataForToday(rows, ctx) {
+  return rows.some(r => normalizeHistory(r.up_tracks, ctx.weekStart).days.some(d => d.date === ctx.today));
+}
+
+// Returns why an existing lock may be taken over, or null if it must be respected.
+function staleLockReason(lock, rows, ctx) {
+  if (!(Date.parse(lock.expires_at) > Date.now())) return 'it expired';
+  const alive = lockOwnerAlive(lock);
+  if (alive === true) return null;                      // live owner on this machine: never take over
+  if (alive === false) return 'its owner process is no longer running';
+  // Owner unknown: look at the data. Nothing recorded for today ("days": []) means no work
+  // to protect, so a lock that old is a leftover of a run that died before saving anything.
+  const age = Date.now() - Date.parse(lock.acquired_at);
+  if (CFG.lockIdleMs > 0 && age >= CFG.lockIdleMs && !hasDataForToday(rows, ctx)) {
+    return `no data is recorded for ${ctx.today} ("days" is empty)`;
+  }
+  return null;
+}
+
 async function acquireLock(sb, rows, ctx) {
   const coordAddress = rows[0].address; // first row by address: same choice for every run
   const fresh = await readRow(sb, coordAddress);
   const raw = fresh ? fresh.up_tracks : null;
   const existing = isObj(raw) && isObj(raw.lock) ? raw.lock : null;
-  if (existing && existing.token && Date.parse(existing.expires_at) > Date.now()) {
-    log(`[!] Another run holds the batch lock (since ${existing.acquired_at}). Exiting.`);
-    return null;
+  if (existing && existing.token) {
+    const why = staleLockReason(existing, rows, ctx);
+    if (!why) {
+      log(`[!] Another run holds the batch lock (since ${existing.acquired_at}). Exiting.`);
+      return null;
+    }
+    log(`[~] Taking over batch lock from ${existing.acquired_at}: ${why}.`);
   }
-  if (existing && existing.token) log(`[~] Taking over expired batch lock from ${existing.acquired_at}.`);
 
   const token = crypto.randomUUID();
-  const lock = { token, acquired_at: new Date().toISOString(), expires_at: new Date(Date.now() + CFG.lockTtlMs).toISOString() };
+  const lock = {
+    token, acquired_at: new Date().toISOString(), expires_at: new Date(Date.now() + CFG.lockTtlMs).toISOString(),
+    pid: process.pid, host: os.hostname(),
+  };
   const next = isObj(raw) ? { ...raw, lock } : { week_start: ctx.weekStart, days: [], lock };
 
   let q = sb.from('audius').update({ up_tracks: next }).eq('address', coordAddress);
