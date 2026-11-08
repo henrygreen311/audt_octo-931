@@ -368,7 +368,7 @@ async function releaseLock(sb, ctx, lock) {
   }
 }
 
-const hasCreds = r => !!(r.user_id && r.app_data && r.app_data.api_key && r.app_data.api_secret && r.app_data.bearer_token);
+const hasCreds = r => !!(r.user_id && r.app_data && r.app_data.api_key && r.app_data.bearer_token);
 
 async function apiGet(pathname, params, what, headers = {}) {
   const controller = new AbortController();
@@ -519,7 +519,7 @@ async function playStream(acct, streamId, playMs, durationSec) {
     } else if (bytes < rate * (playMs / 1000) * 0.9) {
       throw interrupted(`only ${Math.round(bytes / 1024)} of ${Math.round((rate * playMs) / 1000 / 1024)} KB delivered in ${Math.round(wallMs / 1000)}s`);
     }
-    return { bytes, wallMs, playbackMs: Math.min(mediaMs, wallMs), ended };
+    return { bytes, wallMs, playbackMs: Math.min(mediaMs, wallMs), ended, status: res.status, contentType: res.headers.get('content-type') || 'unknown', url: `/v1/tracks/${streamId}/stream` };
   } finally {
     clearTimeout(connectTimer);
     clearTimeout(overallTimer);
@@ -531,7 +531,8 @@ async function playStream(acct, streamId, playMs, durationSec) {
 async function streamJob(sb, ctx, run, acct, target) {
   const st = run.stats;
   const who = acct.handle ? `@${acct.handle}` : acct.address;
-  const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id} | ${text}`); };
+  let idTag = '';
+  const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id}${idTag} | ${text}`); };
   let result = null;
   let outcome;
   let stage = 'trackInfo';
@@ -542,6 +543,7 @@ async function streamJob(sb, ctx, run, acct, target) {
     const ordinal = (run.todayDone.get(target.key) || 0) + sent + 1;
 
     const meta = await getTrackMeta(run, target);
+    idTag = ` (stream id ${meta.streamId})`;
     let playMs = CFG.streamDurationMs;
     if (ordinal >= CFG.fullPlayAt) {
       playMs = (meta.duration + 5) * 1000;
@@ -579,7 +581,7 @@ async function streamJob(sb, ctx, run, acct, target) {
       if (e instanceof LockLostError) run.abort = e;
     }
     acct.today++;
-    const detail = `${(result.playbackMs / 1000).toFixed(1)}s played in ${(result.wallMs / 1000).toFixed(1)}s, ${Math.round(result.bytes / 1024)} KB${result.ended ? ', stream ended' : ''}`;
+    const detail = `${(result.playbackMs / 1000).toFixed(1)}s played in ${(result.wallMs / 1000).toFixed(1)}s, ${Math.round(result.bytes / 1024)} KB${result.ended ? ', stream ended' : ''}, HTTP ${result.status} ${result.contentType}, user ${acct.user_id}`;
     if (!saved) log(`[!] ${who} -> track ${target.id} | completed (${detail}), DB save failed (kept locally)`);
     else say(`completed: ${detail}`);
   }
