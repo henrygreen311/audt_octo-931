@@ -80,6 +80,7 @@ const CFG = {
   maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
   maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
+  streamIdMode: (process.env.STREAM_ID || 'numeric').toLowerCase(),
   apiBase: process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1',
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
@@ -391,6 +392,15 @@ async function apiGet(pathname, params, what, headers = {}) {
   }
 }
 
+async function getNumericId(trackId) {
+  if (/^\d+$/.test(String(trackId))) return String(trackId);
+  const res = await apiGet(`/tracks/${trackId}`, { app_name: 'stream' }, 'track info');
+  const d = res.json && res.json.data;
+  const n = d && (d.track_id !== undefined ? d.track_id : d.trackId);
+  if (n === undefined || n === null || !/^\d+$/.test(String(n))) throw new Error('numeric track_id missing in track info');
+  return String(n);
+}
+
 async function getDurationSec(trackId) {
   const res = await apiGet(`/tracks/${trackId}`, { app_name: 'stream' }, 'track info');
   return (res.json && res.json.data && res.json.data.duration) || 180;
@@ -478,6 +488,17 @@ async function streamJob(sb, ctx, run, acct, target) {
     run.started.set(target.key, sent + 1);
     const ordinal = (run.todayDone.get(target.key) || 0) + sent + 1;
 
+    let streamId = target.id;
+    if (CFG.streamIdMode !== 'hash') {
+      stage = 'trackId';
+      if (!run.ids.has(target.key)) {
+        const p = getNumericId(target.id);
+        run.ids.set(target.key, p);
+        p.catch(() => run.ids.delete(target.key));
+      }
+      streamId = await run.ids.get(target.key);
+    }
+
     if (ordinal >= CFG.fullPlayAt) {
       stage = 'trackInfo';
       const durSec = await getDurationSec(target.id);
@@ -486,7 +507,7 @@ async function streamJob(sb, ctx, run, acct, target) {
     }
 
     stage = 'play';
-    received = await playStream(acct, target.id, playMs);
+    received = await playStream(acct, streamId, playMs);
 
     verified = true;
     run.consecFail = 0;
@@ -642,7 +663,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     });
   }
 
-  const run = { todayDone, started: new Map(), startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, reasons: new Map(), stats: { ok: 0, rate: 0, retry: 0, perm: 0 } };
+  const run = { todayDone, started: new Map(), ids: new Map(), startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, reasons: new Map(), stats: { ok: 0, rate: 0, retry: 0, perm: 0 } };
   const st = run.stats;
   let incomplete = false;
 
