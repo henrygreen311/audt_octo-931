@@ -54,7 +54,7 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
 }
 
 const log = console.log.bind(console);
-const VERBOSE = process.env.VERBOSE === undefined ? !process.argv.includes('--quiet') : /^(1|true|yes)$/i.test(process.env.VERBOSE) || process.argv.includes('--verbose') || process.argv.includes('-v');
+const VERBOSE = /^(1|true|yes)$/i.test(process.env.VERBOSE || '') || process.argv.includes('--verbose') || process.argv.includes('-v');
 let lastBgLog = 0;
 process.on('unhandledRejection', e => {
   if (Date.now() - lastBgLog < 30000) return;
