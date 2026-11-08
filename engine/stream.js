@@ -97,12 +97,11 @@ const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
   dailyPerTrack: Number(process.env.DAILY_STREAMS_PER_TRACK || 1000),
   dailyPerPreviousTrack: Number(process.env.DAILY_STREAMS_PER_PREVIOUS_TRACK || 200),
-  maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
-  maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
+  maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 100),
+  maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 20),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || STREAM_DURATION_MS),
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
-  runsPerDay: 2,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
@@ -243,7 +242,7 @@ function collectTracks(upTracks, today) {
       id, key: id, address: d.address || null, handle: typeof d.handle === 'string' ? d.handle : null,
       date: d.date, previous: !isToday,
       cap: isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack,
-      maxPerRun: (isToday ? CFG.maxStreamsPerRunToday : CFG.maxStreamsPerRunPrev) || Math.ceil((isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack) / CFG.runsPerDay)
+      maxPerRun: (isToday ? CFG.maxStreamsPerRunToday : CFG.maxStreamsPerRunPrev) || (isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack)
     });
   }
   return [...seen.values()].sort((x, y) => (x.previous - y.previous) || (x.date < y.date ? 1 : x.date > y.date ? -1 : 0));
@@ -436,11 +435,10 @@ function allDoneMsg(n) {
 }
 
 function dayState(coord, today) {
-  for (let n = 1; n <= CFG.runsPerDay; n++) {
-    const b = (coord.batches || []).find(x => x.date === today && x.run_number === n);
-    if (!b || !b.done) return { runNumber: n, batch: b || null };
-  }
-  return null;
+  const todays = (coord.batches || []).filter(x => x.date === today);
+  const open = todays.find(x => !x.done);
+  if (open) return { runNumber: open.run_number, batch: open };
+  return { runNumber: todays.reduce((m, x) => Math.max(m, x.run_number), 0) + 1, batch: null };
 }
 
 function reason(e) {
@@ -783,10 +781,6 @@ async function runStream({ now = new Date() } = {}) {
     log(allDoneMsg(published.length));
     return { status: 'ALREADY_COMPLETED' };
   }
-  if (!dayState(normalizeStream(coordRaw, ctx.weekStart), ctx.today)) {
-    log('[*] Both runs already done today. Exiting.');
-    return { status: 'ALREADY_COMPLETED' };
-  }
 
   const lock = await acquireLock(sb, ctx);
   if (!lock) return { status: 'LOCKED' };
@@ -802,12 +796,7 @@ async function runStream({ now = new Date() } = {}) {
       log(allDoneMsg(published.length));
       return { status: 'ALREADY_COMPLETED' };
     }
-    const state = dayState(coord, ctx.today);
-    if (!state) {
-      log('[*] Both runs already done today. Exiting.');
-      return { status: 'ALREADY_COMPLETED' };
-    }
-    return await processRun(sb, ctx, rows, published, state);
+    return await processRun(sb, ctx, rows, published, dayState(coord, ctx.today));
   } finally {
     stopHeartbeat();
     HELD_LOCK = null;
