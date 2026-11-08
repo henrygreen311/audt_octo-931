@@ -10,6 +10,7 @@ const { createClient } = require('@supabase/supabase-js');
 const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS || 'https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev')
   .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
+const REAL_FETCH = globalThis.fetch;
 {
   const realFetch = globalThis.fetch;
   const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
@@ -98,6 +99,7 @@ const CFG = {
   maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
   maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
+  streamDirect: /^(1|true|yes)$/i.test(process.env.STREAM_DIRECT || ''),
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
   runsPerDay: 2,
@@ -425,7 +427,7 @@ async function playStream(url, playMs) {
   let reader = null;
   try {
     try {
-      const res = await fetch(url, { signal: controller.signal });
+      const res = await (CFG.streamDirect ? REAL_FETCH : fetch)(url, { signal: controller.signal });
       if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
       if (!res.body) throw new Error('empty stream response');
       reader = res.body.getReader();
@@ -452,6 +454,7 @@ async function streamJob(sb, ctx, run, acct, target) {
   const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id} | ${text}`); };
   let verified = false;
   let outcome;
+  let stage = 'streamTrack';
 
   try {
     let sdk = run.sdks.get(acct.address);
@@ -467,6 +470,7 @@ async function streamJob(sb, ctx, run, acct, target) {
 
     let playMs = CFG.streamDurationMs;
     if (ordinal >= CFG.fullPlayAt) {
+      stage = 'getTrack';
       const info = await withTimeout(sdk.tracks.getTrack({ trackId: target.id }), CFG.callTimeoutMs, 'getTrack');
       const durSec = (info && info.data && info.data.duration) || 180;
       playMs = (durSec + 5) * 1000;
@@ -475,6 +479,7 @@ async function streamJob(sb, ctx, run, acct, target) {
       say(`playing ${Math.round(playMs / 1000)}s`);
     }
 
+    stage = 'play';
     await playStream(streamUrl, playMs);
 
     verified = true;
@@ -483,9 +488,11 @@ async function streamJob(sb, ctx, run, acct, target) {
     st.ok++;
   } catch (e) {
     const kind = classify(e);
-    if (kind === 'rate') { outcome = 'rate'; st.rate++; say('429'); }
-    else if (kind === 'permanent') { outcome = 'perm'; st.perm++; run.cool.add(acct.address); say(reason(e)); }
-    else { outcome = 'retry'; st.retry++; say(reason(e)); }
+    const why = `${stage}: ${reason(e)}`;
+    run.reasons.set(why, (run.reasons.get(why) || 0) + 1);
+    if (kind === 'rate') { outcome = 'rate'; st.rate++; say(why); }
+    else if (kind === 'permanent') { outcome = 'perm'; st.perm++; run.cool.add(acct.address); say(why); }
+    else { outcome = 'retry'; st.retry++; say(why); }
     if (++run.consecFail >= CFG.failStopAfter && !run.stop) {
       run.stop = true;
       log('[!] Too many failures in a row; stopping. Next run resumes.');
@@ -629,7 +636,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     });
   }
 
-  const run = { todayDone, started: new Map(), startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, sdks: new Map(), stats: { ok: 0, rate: 0, retry: 0, perm: 0 } };
+  const run = { todayDone, started: new Map(), startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, sdks: new Map(), reasons: new Map(), stats: { ok: 0, rate: 0, retry: 0, perm: 0 } };
   const st = run.stats;
   let incomplete = false;
 
@@ -660,6 +667,10 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
       b.done = true;
       return true;
     });
+  }
+  if (run.reasons.size) {
+    const top = [...run.reasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k} x${n}`);
+    log(`[!] Failure reasons: ${top.join(', ')}`);
   }
   const parts = [`${st.ok} streamed`];
   if (st.rate) parts.push(`${st.rate} rate-limited`);
