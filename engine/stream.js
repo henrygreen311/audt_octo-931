@@ -369,17 +369,21 @@ async function releaseLock(sb, ctx, lock) {
 
 const hasCreds = r => !!(r.user_id && r.app_data && r.app_data.api_key && r.app_data.api_secret && r.app_data.bearer_token);
 
-async function apiGet(pathname, params, what) {
+async function apiGet(pathname, params, what, headers = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
   try {
     const res = await (CFG.streamDirect ? REAL_FETCH : fetch)(`${CFG.apiBase}${pathname}?${new URLSearchParams(params)}`, {
-      headers: { Accept: 'application/json' },
+      headers: { Accept: 'application/json', ...headers },
       redirect: 'manual',
       signal: controller.signal,
     });
     if (res.status >= 300 && res.status < 400) return { redirect: res.headers.get('location') };
-    if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
+      throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, detail });
+    }
     return { json: await res.json() };
   } catch (e) {
     if (controller.signal.aborted) throw new Error(`timeout: ${what} took longer than ${CFG.callTimeoutMs / 1000}s`);
@@ -392,7 +396,7 @@ async function apiGet(pathname, params, what) {
 async function getStreamUrl(acct, trackId) {
   const res = await apiGet(`/tracks/${trackId}/stream`, {
     no_redirect: 'true', user_id: acct.user_id, api_key: acct.app_data.api_key, app_name: 'stream',
-  }, 'stream url');
+  }, 'stream url', { Authorization: `Bearer ${acct.app_data.bearer_token}` });
   const url = res.redirect || (res.json && (res.json.data || res.json.url));
   if (typeof url !== 'string' || !url) throw new Error('No stream URL returned');
   return url;
@@ -423,7 +427,7 @@ function dayState(coord, today) {
 function reason(e) {
   if (isRateLimit(e)) return '429';
   const code = statusOf(e);
-  if (code) return `HTTP ${code}`;
+  if (code) return `HTTP ${code}${e.detail ? ` ${e.detail}` : ''}`;
   const m = String((e && e.message) || e);
   if (/timeout|timed out/i.test(m)) return 'timeout';
   return m.slice(0, 50);
