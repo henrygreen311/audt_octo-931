@@ -7,7 +7,49 @@ const path = require('path');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
-console.log('[*] Route: direct');
+const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS || 'https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev')
+  .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
+const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
+{
+  const realFetch = globalThis.fetch;
+  const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+  const downUntil = new Map();
+  const warned = new Set();
+  const ATTEMPTS = Number(process.env.PROXY_ATTEMPTS || 6);
+  const pick = () => {
+    const now = Date.now();
+    const up = PROXY_URLS.filter(u => (downUntil.get(u) || 0) <= now);
+    const pool = up.length ? up : PROXY_URLS;
+    return pool[Math.floor(Math.random() * pool.length)];
+  };
+  console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
+  globalThis.fetch = async (input, init) => {
+    const isReq = typeof input === 'object' && input !== null && 'url' in input;
+    let url;
+    try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
+    if (url.hostname !== 'api.audius.co') return realFetch(input, init);
+    const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
+    if (PROXY_KEY) headers.set('x-proxy-key', PROXY_KEY);
+    let lastErr;
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+      const proxy = pick();
+      const target = proxy + url.pathname + url.search;
+      try {
+        return isReq && !init
+          ? await realFetch(new Request(target, input.clone()), { headers })
+          : await realFetch(target, { ...init, headers });
+      } catch (e) {
+        const code = e && ((e.cause && e.cause.code) || e.code);
+        if (!CONNECT_ERRS.has(code)) throw e;
+        lastErr = e;
+        downUntil.set(proxy, Date.now() + 20000);
+        if (!warned.has(proxy)) { warned.add(proxy); console.log(`[!] Proxy ${new URL(proxy).host} unreachable; using another.`); }
+        await new Promise(r => setTimeout(r, 300 * attempt));
+      }
+    }
+    throw lastErr;
+  };
+}
 
 const log = console.log.bind(console);
 const VERBOSE = process.env.VERBOSE === undefined ? !process.argv.includes('--quiet') : /^(1|true|yes)$/i.test(process.env.VERBOSE) || process.argv.includes('--verbose') || process.argv.includes('-v');
@@ -55,7 +97,7 @@ const CFG = {
   dailyPerPreviousTrack: Number(process.env.DAILY_STREAMS_PER_PREVIOUS_TRACK || 200),
   maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
   maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
-  streamDurationMs: Number(process.env.STREAM_DURATION_MS || 60000),
+  streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
   runsPerDay: 2,
@@ -69,6 +111,7 @@ const CFG = {
   assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
+  concurrency: Number(process.env.CONCURRENCY || 5),
 };
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -558,21 +601,32 @@ async function streamJob(sb, ctx, run, acct, target) {
 
 async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let got = 0;
+  let inflight = 0;
   let started = 0;
-  while (got < maxOk && started < attempts) {
-    if (run.abort || LOCK_LOST || run.stop) break;
+  const step = async () => {
+    if (run.abort || LOCK_LOST || run.stop) return false;
     if (CFG.maxRunMs && Date.now() - run.startedAt > CFG.maxRunMs) {
       run.stop = true;
       log('[!] Time limit reached; stopping. Next run resumes.');
-      break;
+      return false;
+    }
+    if (got >= maxOk || started >= attempts) return false;
+    if (got + inflight >= maxOk) {
+      if (!inflight) return false;
+      await sleep(50);
+      return true;
     }
     let acct = candidates.shift();
     while (acct && run.cool.has(acct.address)) acct = candidates.shift();
-    if (!acct) break;
+    if (!acct) return false;
+    inflight++;
     started++;
     const outcome = await streamJob(sb, ctx, run, acct, target);
+    inflight--;
     if (outcome === 'ok') got++;
-  }
+    return true;
+  };
+  await Promise.all(Array.from({ length: Math.max(1, CFG.concurrency) }, async () => { while (await step()); }));
   return { got, started, skipped: started - got };
 }
 
