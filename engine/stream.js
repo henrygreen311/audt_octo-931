@@ -52,24 +52,6 @@ const REAL_FETCH = globalThis.fetch;
   };
 }
 
-let sdkPkg;
-try {
-  sdkPkg = require('@audius/sdk');
-} catch (e) {
-  console.error('[!] Failed to require @audius/sdk:', e.message);
-  process.exit(1);
-}
-let sdkFactory;
-if (typeof sdkPkg === 'function') sdkFactory = sdkPkg;
-else if (typeof sdkPkg.sdk === 'function') sdkFactory = sdkPkg.sdk;
-else if (typeof sdkPkg.default === 'function') sdkFactory = sdkPkg.default;
-else if (sdkPkg.default && typeof sdkPkg.default.sdk === 'function') sdkFactory = sdkPkg.default.sdk;
-else sdkFactory = Object.values(sdkPkg).find(v => typeof v === 'function' && v.name.toLowerCase().includes('sdk'));
-if (!sdkFactory) {
-  console.error('[!] Could not find SDK factory function in @audius/sdk exports.');
-  process.exit(1);
-}
-
 const log = console.log.bind(console);
 const VERBOSE = /^(1|true|yes)$/i.test(process.env.VERBOSE || '') || process.argv.includes('--verbose') || process.argv.includes('-v');
 let lastBgLog = 0;
@@ -100,6 +82,7 @@ const CFG = {
   maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
   streamDirect: /^(1|true|yes)$/i.test(process.env.STREAM_DIRECT || ''),
+  apiBase: process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1',
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
   runsPerDay: 2,
@@ -386,12 +369,38 @@ async function releaseLock(sb, ctx, lock) {
 
 const hasCreds = r => !!(r.user_id && r.app_data && r.app_data.api_key && r.app_data.api_secret && r.app_data.bearer_token);
 
-function makeSdk(acct) {
-  return sdkFactory({
-    apiKey: acct.app_data.api_key,
-    apiSecret: acct.app_data.api_secret,
-    bearerToken: acct.app_data.bearer_token,
-  });
+async function apiGet(pathname, params, what) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
+  try {
+    const res = await (CFG.streamDirect ? REAL_FETCH : fetch)(`${CFG.apiBase}${pathname}?${new URLSearchParams(params)}`, {
+      headers: { Accept: 'application/json' },
+      redirect: 'manual',
+      signal: controller.signal,
+    });
+    if (res.status >= 300 && res.status < 400) return { redirect: res.headers.get('location') };
+    if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+    return { json: await res.json() };
+  } catch (e) {
+    if (controller.signal.aborted) throw new Error(`timeout: ${what} took longer than ${CFG.callTimeoutMs / 1000}s`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getStreamUrl(acct, trackId) {
+  const res = await apiGet(`/tracks/${trackId}/stream`, {
+    no_redirect: 'true', user_id: acct.user_id, api_key: acct.app_data.api_key, app_name: 'stream',
+  }, 'stream url');
+  const url = res.redirect || (res.json && (res.json.data || res.json.url));
+  if (typeof url !== 'string' || !url) throw new Error('No stream URL returned');
+  return url;
+}
+
+async function getDurationSec(trackId) {
+  const res = await apiGet(`/tracks/${trackId}`, { app_name: 'stream' }, 'track info');
+  return (res.json && res.json.data && res.json.data.duration) || 180;
 }
 
 function tracksBelowCap(rows, published, ctx) {
@@ -454,15 +463,10 @@ async function streamJob(sb, ctx, run, acct, target) {
   const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id} | ${text}`); };
   let verified = false;
   let outcome;
-  let stage = 'streamTrack';
+  let stage = 'streamUrl';
 
   try {
-    let sdk = run.sdks.get(acct.address);
-    if (!sdk) { sdk = makeSdk(acct); run.sdks.set(acct.address, sdk); }
-
-    const streamRes = await withTimeout(sdk.tracks.streamTrack({ trackId: target.id, userId: acct.user_id }), CFG.callTimeoutMs, 'streamTrack');
-    const streamUrl = typeof streamRes === 'string' ? streamRes : streamRes && (streamRes.data || streamRes.url);
-    if (typeof streamUrl !== 'string' || !streamUrl) throw new Error('No stream URL returned');
+    const streamUrl = await getStreamUrl(acct, target.id);
 
     const sent = run.started.get(target.key) || 0;
     run.started.set(target.key, sent + 1);
@@ -470,9 +474,8 @@ async function streamJob(sb, ctx, run, acct, target) {
 
     let playMs = CFG.streamDurationMs;
     if (ordinal >= CFG.fullPlayAt) {
-      stage = 'getTrack';
-      const info = await withTimeout(sdk.tracks.getTrack({ trackId: target.id }), CFG.callTimeoutMs, 'getTrack');
-      const durSec = (info && info.data && info.data.duration) || 180;
+      stage = 'trackInfo';
+      const durSec = await getDurationSec(target.id);
       playMs = (durSec + 5) * 1000;
       say(`playing full track (~${durSec}s)`);
     } else {
@@ -636,7 +639,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     });
   }
 
-  const run = { todayDone, started: new Map(), startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, sdks: new Map(), reasons: new Map(), stats: { ok: 0, rate: 0, retry: 0, perm: 0 } };
+  const run = { todayDone, started: new Map(), startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, reasons: new Map(), stats: { ok: 0, rate: 0, retry: 0, perm: 0 } };
   const st = run.stats;
   let incomplete = false;
 
