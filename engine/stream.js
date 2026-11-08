@@ -10,7 +10,6 @@ const { createClient } = require('@supabase/supabase-js');
 const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS || 'https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev')
   .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
-const REAL_FETCH = globalThis.fetch;
 {
   const realFetch = globalThis.fetch;
   const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
@@ -53,7 +52,7 @@ const REAL_FETCH = globalThis.fetch;
 }
 
 const log = console.log.bind(console);
-const VERBOSE = /^(1|true|yes)$/i.test(process.env.VERBOSE || '') || process.argv.includes('--verbose') || process.argv.includes('-v');
+const VERBOSE = process.env.VERBOSE === undefined ? !process.argv.includes('--quiet') : /^(1|true|yes)$/i.test(process.env.VERBOSE) || process.argv.includes('--verbose') || process.argv.includes('-v');
 let lastBgLog = 0;
 process.on('unhandledRejection', e => {
   if (Date.now() - lastBgLog < 30000) return;
@@ -81,7 +80,6 @@ const CFG = {
   maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
   maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
-  streamDirect: /^(1|true|yes)$/i.test(process.env.STREAM_DIRECT || ''),
   apiBase: process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1',
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
@@ -373,7 +371,7 @@ async function apiGet(pathname, params, what, headers = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
   try {
-    const res = await (CFG.streamDirect ? REAL_FETCH : fetch)(`${CFG.apiBase}${pathname}?${new URLSearchParams(params)}`, {
+    const res = await fetch(`${CFG.apiBase}${pathname}?${new URLSearchParams(params)}`, {
       headers: { Accept: 'application/json', ...headers },
       redirect: 'manual',
       signal: controller.signal,
@@ -391,15 +389,6 @@ async function apiGet(pathname, params, what, headers = {}) {
   } finally {
     clearTimeout(timer);
   }
-}
-
-async function getStreamUrl(acct, trackId) {
-  const res = await apiGet(`/tracks/${trackId}/stream`, {
-    no_redirect: 'true', user_id: acct.user_id, api_key: acct.app_data.api_key, app_name: 'stream',
-  }, 'stream url', { Authorization: `Bearer ${acct.app_data.bearer_token}` });
-  const url = res.redirect || (res.json && (res.json.data || res.json.url));
-  if (typeof url !== 'string' || !url) throw new Error('No stream URL returned');
-  return url;
 }
 
 async function getDurationSec(trackId) {
@@ -433,19 +422,30 @@ function reason(e) {
   return m.slice(0, 50);
 }
 
-async function playStream(url, playMs) {
+async function playStream(acct, trackId, playMs) {
   const startedAt = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
   let reader = null;
   try {
     try {
-      const res = await (CFG.streamDirect ? REAL_FETCH : fetch)(url, { signal: controller.signal });
-      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
-      if (!res.body) throw new Error('empty stream response');
-      reader = res.body.getReader();
-      const first = await reader.read();
-      if (first.done || !first.value || !first.value.length) throw new Error('empty stream response');
+      const qs = new URLSearchParams({ user_id: acct.user_id, api_key: acct.app_data.api_key, app_name: 'stream' });
+      const res = await fetch(`${CFG.apiBase}/tracks/${trackId}/stream?${qs}`, {
+        headers: { Authorization: `Bearer ${acct.app_data.bearer_token}` },
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      if (!(res.status >= 300 && res.status < 400)) {
+        if (!res.ok) {
+          let detail = '';
+          try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
+          throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, detail });
+        }
+        if (!res.body) throw new Error('empty stream response');
+        reader = res.body.getReader();
+        const first = await reader.read();
+        if (first.done || !first.value || !first.value.length) throw new Error('empty stream response');
+      }
     } catch (e) {
       if (controller.signal.aborted) throw new Error(`timeout: stream request took longer than ${CFG.callTimeoutMs / 1000}s`);
       throw e;
@@ -467,27 +467,23 @@ async function streamJob(sb, ctx, run, acct, target) {
   const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id} | ${text}`); };
   let verified = false;
   let outcome;
-  let stage = 'streamUrl';
+  let stage = 'play';
+  let playMs = CFG.streamDurationMs;
 
   try {
-    const streamUrl = await getStreamUrl(acct, target.id);
-
     const sent = run.started.get(target.key) || 0;
     run.started.set(target.key, sent + 1);
     const ordinal = (run.todayDone.get(target.key) || 0) + sent + 1;
 
-    let playMs = CFG.streamDurationMs;
     if (ordinal >= CFG.fullPlayAt) {
       stage = 'trackInfo';
       const durSec = await getDurationSec(target.id);
       playMs = (durSec + 5) * 1000;
       say(`playing full track (~${durSec}s)`);
-    } else {
-      say(`playing ${Math.round(playMs / 1000)}s`);
     }
 
     stage = 'play';
-    await playStream(streamUrl, playMs);
+    await playStream(acct, target.id, playMs);
 
     verified = true;
     run.consecFail = 0;
@@ -519,7 +515,7 @@ async function streamJob(sb, ctx, run, acct, target) {
     }
     acct.today++;
     if (!saved) log(`[!] ${who} -> track ${target.id} | streamed, DB save failed (kept locally)`);
-    else say('successful');
+    else say(`streamed ${Math.round(playMs / 1000)}s`);
   }
 
   if (CFG.streamDelayMs) await sleep(CFG.streamDelayMs);
