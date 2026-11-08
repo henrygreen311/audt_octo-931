@@ -52,9 +52,9 @@ const TARGET_ADDRESS = 'qringgreen@gmail.com';
 
 const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
-  accountsPerDay: 20,
+  accountsPerDay: 10,
   tracksPerDay: 3,
-  priorityHandles: ['qring', 'tradex', 'obi350965', '7ebe3e67', '904c4687', '4c9ebc6a', 'd71a941b', 'a8cde724', 'b41ba8a6', 'e8b592ac'],
+  priorityHandles: ['qring', 'obi350965', '7ebe3e67', '904c4687', '4c9ebc6a', 'd71a941b', 'a8cde724', 'b41ba8a6', 'e8b592ac'],
   priorityPerWeek: 3,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   // A lock of unknown ownership with no data recorded for today is treated as stale after this long (0 = off).

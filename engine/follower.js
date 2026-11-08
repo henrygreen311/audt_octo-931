@@ -592,12 +592,6 @@ async function processRun(sb, ctx, rows, published, { runNumber, batch }) {
   const { targets, unresolved } = await resolveTargets(published, makeSdk(reader));
   if (!targets.length) { log('[!] No handles found on Audius. Exiting.'); return { status: 'NO_TARGETS' }; }
 
-  const ids = new Set(targets.map(t => t.id));
-  const keys = new Set(targets.map(t => t.key));
-  const targetAddrs = new Set(published.map(p => p.address).filter(Boolean));
-  const excluded = new Set(accounts.filter(a =>
-    targetAddrs.has(a.address) || ids.has(String(a.user_id)) || (a.handle && keys.has(a.handle.toLowerCase()))).map(a => a.address));
-
   const todayDone = countHandles(rows, ctx);
   const runDone = countHandles(rows, ctx, runNumber);
   const lastRun = runNumber >= CFG.runsPerDay;
@@ -633,7 +627,7 @@ async function processRun(sb, ctx, rows, published, { runNumber, batch }) {
     const want = need.get(t.key);
     if (!want) continue;
     if (run.stop) { incomplete = true; continue; }
-    const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !a.followed.has(t.key) && !run.cool.has(a.address));
+    const pool = accounts.filter(a => a.hasCreds && String(a.user_id) !== String(t.id) && !(a.handle && a.handle.toLowerCase() === t.key) && !a.followed.has(t.key) && !run.cool.has(a.address));
     const candidates = shuffle(pool).sort((x, y) => x.today - y.today);
     const { got, transient, skipped } = await fillHandle(sb, ctx, run, t, want, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;

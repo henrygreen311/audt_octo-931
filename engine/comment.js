@@ -103,6 +103,8 @@ const CFG = {
   verifyTries: 3,
   verifyDelayMs: Number(process.env.VERIFY_DELAY_MS || 500),
   failStopAfter: Number(process.env.FAIL_STOP_AFTER || 20),
+  minFollowers: Number(process.env.MIN_COMMENTER_FOLLOWERS || 50),
+  followerBatch: Number(process.env.FOLLOWER_CHECK_BATCH || 50),
   emojiShare: process.env.COMMENT_EMOJI_SHARE === undefined ? 0.3 : Number(process.env.COMMENT_EMOJI_SHARE),
   scanPages: Number(process.env.COMMENT_SCAN_PAGES || 5),
   commentDelayMs: Number(process.env.COMMENT_DELAY_MS || 100),
@@ -585,6 +587,27 @@ async function verifyComment(sdk, userId, trackId, message) {
   return null;
 }
 
+async function loadFollowerCounts(sdk, ids) {
+  const counts = new Map();
+  for (let i = 0; i < ids.length; i += CFG.followerBatch) {
+    const chunk = ids.slice(i, i + CFG.followerBatch);
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      try {
+        const res = await readRetry(() => sdk.users.getBulkUsers({ id: chunk }));
+        for (const u of (res && res.data) || []) {
+          const n = u.followerCount !== undefined ? u.followerCount : u.follower_count;
+          if (Number.isFinite(Number(n))) counts.set(String(u.id), Number(n));
+        }
+        break;
+      } catch (e) {
+        if (!isRateLimit(e) || attempt === 3) break;
+        await sleep(3000 * (attempt + 1));
+      }
+    }
+  }
+  return counts;
+}
+
 function tracksBelowCap(rows, published, ctx) {
   const today = countTracks(rows, ctx);
   return published.filter(p => (today.get(p.key) || 0) < p.cap);
@@ -752,8 +775,19 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     entityIdOf(targets[0].id);
   }
 
-  const targetAddrs = new Set(targets.map(p => p.address).filter(Boolean));
-  const excluded = new Set(accounts.filter(a => targetAddrs.has(a.address)).map(a => a.address));
+  const withCreds = accounts.filter(a => a.hasCreds);
+  const followerCounts = await loadFollowerCounts(makeSdk(reader), withCreds.map(a => String(a.user_id)));
+  for (const a of accounts) {
+    const n = followerCounts.get(String(a.user_id));
+    a.qualified = a.hasCreds && n !== undefined && n >= CFG.minFollowers;
+  }
+  const qualifiedCount = accounts.filter(a => a.qualified).length;
+  const unknownCount = withCreds.filter(a => !followerCounts.has(String(a.user_id))).length;
+  if (!qualifiedCount) log(`[!] No accounts with ${CFG.minFollowers}+ followers available.`);
+  else if (VERBOSE) {
+    log(`[*] Follower check: ${qualifiedCount} of ${withCreds.length} accounts have ${CFG.minFollowers}+ followers.`);
+    if (unknownCount) log(`[*] Follower count unavailable for ${unknownCount} accounts; skipped this run.`);
+  }
 
   const todayDone = countTracks(rows, ctx);
   const runDone = countTracks(rows, ctx, runNumber);
@@ -807,7 +841,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const n = need.get(t.key);
     if (!n.attempts) continue;
     if (run.stop) { incomplete = true; continue; }
-    const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !a.commented.has(t.key) && !run.cool.has(a.address));
+    const pool = accounts.filter(a => a.qualified && !a.commented.has(t.key) && !run.cool.has(a.address));
     const candidates = shuffle(pool).sort((x, y) => x.today - y.today);
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;

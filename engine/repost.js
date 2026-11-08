@@ -574,8 +574,6 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     }
   }
 
-  const targetAddrs = new Set(targets.map(p => p.address).filter(Boolean));
-  const excluded = new Set(accounts.filter(a => targetAddrs.has(a.address)).map(a => a.address));
 
   const todayDone = countTracks(rows, ctx);
   const runDone = countTracks(rows, ctx, runNumber);
@@ -629,7 +627,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const n = need.get(t.key);
     if (!n.attempts) continue;
     if (run.stop) { incomplete = true; continue; }
-    const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !a.reposted.has(t.key) && !run.cool.has(a.address));
+    const pool = accounts.filter(a => a.hasCreds && !a.reposted.has(t.key) && !run.cool.has(a.address));
     const candidates = shuffle(pool).sort((x, y) => x.today - y.today);
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
