@@ -80,7 +80,7 @@ const CFG = {
   maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
   maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
-  streamIdMode: (process.env.STREAM_ID || 'numeric').toLowerCase(),
+  streamIdMode: (process.env.STREAM_ID || 'numeric').toLowerCase(), // deprecated; kept for env compatibility
   apiBase: process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1',
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
@@ -93,14 +93,20 @@ const CFG = {
   concurrency: Number(process.env.CONCURRENCY || 10),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
+  appName: process.env.AUDIUS_APP_NAME || 'stream',
 };
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
+const NUMERIC_ID_RE = /^\d+$/;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
 const statusOf = e => e && ((e.response && e.response.status) || e.status);
 const errMsg = e => `${statusOf(e) ? `HTTP ${statusOf(e)} ` : ''}${(e && e.message) || e}`;
+
+function isLikelyHashId(v) {
+  return typeof v === 'string' && TRACK_ID_RE.test(v.trim()) && !NUMERIC_ID_RE.test(v.trim());
+}
 
 function shuffle(arr) {
   const a = [...arr];
@@ -141,6 +147,7 @@ async function withRetry(fn, retryIf = isTransient, tries = CFG.retries) {
   }
   throw lastErr;
 }
+
 function withTimeout(promise, ms = CFG.callTimeoutMs, what = 'request') {
   let t;
   const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`timeout: ${what} took longer than ${ms / 1000}s`)), ms); });
@@ -207,19 +214,30 @@ async function readUpTracks(sb) {
   return data && data[0] ? data[0].up_tracks : null;
 }
 
+function pickTrackId(d) {
+  const raw = [];
+  if (typeof d.id === 'string' && d.id.trim()) raw.push(d.id.trim());
+  if (typeof d.track_id === 'string' && d.track_id.trim()) raw.push(d.track_id.trim());
+  if (typeof d.track_id === 'number') raw.push(String(d.track_id));
+  const hash = raw.find(isLikelyHashId);
+  if (hash) return hash;
+  const any = raw.find(x => TRACK_ID_RE.test(x));
+  return any || null;
+}
+
 function collectTracks(upTracks, today) {
   const days = isObj(upTracks) && Array.isArray(upTracks.days) ? upTracks.days : [];
   const seen = new Map();
   for (const d of days) {
-    if (!d || d.status !== 'success' || d.track_id == null || typeof d.date !== 'string' || d.date > today) continue;
-    const id = String(d.track_id).trim();
-    if (!TRACK_ID_RE.test(id)) continue;
+    if (!d || d.status !== 'success' || typeof d.date !== 'string' || d.date > today) continue;
+    const id = pickTrackId(d);
+    if (!id) continue;
     const isToday = d.date === today;
     const prev = seen.get(id);
     if (prev && !(isToday && prev.previous)) continue;
     seen.set(id, {
       id, key: id, address: d.address || null, handle: typeof d.handle === 'string' ? d.handle : null,
-      date: d.date, previous: !isToday, 
+      date: d.date, previous: !isToday,
       cap: isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack,
       maxPerRun: (isToday ? CFG.maxStreamsPerRunToday : CFG.maxStreamsPerRunPrev) || Math.ceil((isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack) / CFG.runsPerDay)
     });
@@ -267,18 +285,23 @@ async function updateStream(sb, address, weekStart, mutate) {
   throw lastErr;
 }
 
-async function recordStream(sb, weekStart, address, f) {
-  const key = String(f.track_id);
+function isCountedEntry(t) {
+  return !!t && (t.result === 'completed' || t.status === 'success');
+}
+
+function entryCount(t) {
+  if (!t) return 0;
+  if (t.result === 'completed') return 1;
+  if (t.status === 'success') return t.count || 1;
+  return 0;
+}
+
+async function recordStream(sb, weekStart, address, item) {
   await updateStream(sb, address, weekStart, h => {
-    let run = h.runs.find(r => r.date === f.date && r.run_number === f.run_number);
-    if (!run) { run = { date: f.date, day: f.day, run_number: f.run_number, tracks: [] }; h.runs.push(run); }
-    const entry = run.tracks.find(t => String(t.track_id) === key && t.status === 'success');
-    if (entry) {
-      entry.count = (entry.count || 1) + 1;
-      entry.streamed_at = f.at;
-    } else {
-      run.tracks.push({ track_id: key, status: 'success', count: 1, streamed_at: f.at });
-    }
+    let run = h.runs.find(r => r.date === item.date && r.run_number === item.run_number);
+    if (!run) { run = { date: item.date, day: item.day, run_number: item.run_number, tracks: [] }; h.runs.push(run); }
+    if (run.tracks.some(t => t.test_id && t.test_id === item.test_id)) return false;
+    run.tracks.push(item);
     return true;
   });
 }
@@ -299,7 +322,7 @@ async function flushPending(sb, ctx) {
     if (p.week_start !== ctx.weekStart) continue;
     try { await recordStream(sb, ctx.weekStart, p.address, p); } catch (_) { keep.push(p); }
   }
-  log(`[*] Recovered ${PENDING.length - keep.length}/${PENDING.length} unsaved streams.`);
+  log(`[*] Recovered ${PENDING.length - keep.length}/${PENDING.length} unsaved tests.`);
   PENDING = keep;
   savePending();
 }
@@ -339,10 +362,11 @@ let LOCK_LOST = null;
 function startHeartbeat(sb, ctx) {
   let busy = false;
   const timer = setInterval(async () => {
-    if (busy || LOCK_LOST) return;
+    if (busy || LOCK_LOST || !HELD_LOCK) return;
     busy = true;
     try {
       await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+        if (!h.lock || h.lock.token !== HELD_LOCK.token) throw new LockLostError('lock missing during heartbeat');
         h.lock.beat = new Date().toISOString();
         h.lock.expires_at = new Date(Date.now() + CFG.lockTtlMs).toISOString();
         return true;
@@ -372,7 +396,8 @@ async function apiGet(pathname, params, what, headers = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
   try {
-    const res = await fetch(`${CFG.apiBase}${pathname}?${new URLSearchParams(params)}`, {
+    const qs = new URLSearchParams({ ...params, app_name: CFG.appName });
+    const res = await fetch(`${CFG.apiBase}${pathname}?${qs}`, {
       headers: { Accept: 'application/json', ...headers },
       redirect: 'manual',
       signal: controller.signal,
@@ -392,18 +417,18 @@ async function apiGet(pathname, params, what, headers = {}) {
   }
 }
 
-async function getNumericId(trackId) {
-  if (/^\d+$/.test(String(trackId))) return String(trackId);
-  const res = await apiGet(`/tracks/${trackId}`, { app_name: 'stream' }, 'track info');
-  const d = res.json && res.json.data;
-  const n = d && (d.track_id !== undefined ? d.track_id : d.trackId);
-  if (n === undefined || n === null || !/^\d+$/.test(String(n))) throw new Error('numeric track_id missing in track info');
-  return String(n);
-}
-
-async function getDurationSec(trackId) {
-  const res = await apiGet(`/tracks/${trackId}`, { app_name: 'stream' }, 'track info');
-  return (res.json && res.json.data && res.json.data.duration) || 180;
+async function resolveTrackForStreaming(candidate) {
+  const requested = String(candidate.id);
+  const res = await apiGet(`/tracks/${encodeURIComponent(requested)}`, {}, 'track info');
+  const data = res.json && res.json.data;
+  if (!data) throw new Error('track metadata missing');
+  const apiId = typeof data.id === 'string' && data.id.trim() ? data.id.trim() : null;
+  const apiTrackId = data.track_id !== undefined && data.track_id !== null ? String(data.track_id) : null;
+  if (!apiId) throw new Error('track metadata missing canonical id');
+  const matches = String(apiId) === requested || (apiTrackId !== null && apiTrackId === requested);
+  if (!matches) throw new Error(`track id mismatch: requested=${requested} api.id=${apiId} api.track_id=${apiTrackId}`);
+  const duration = Number(data.duration);
+  return { streamId: apiId, duration: Number.isFinite(duration) && duration > 0 ? duration : 180, data };
 }
 
 function tracksBelowCap(rows, published, ctx) {
@@ -412,7 +437,7 @@ function tracksBelowCap(rows, published, ctx) {
 }
 
 function allDoneMsg(n) {
-  return `[*] All ${n} tracks reached their daily stream limit. Exiting.`;
+  return `[*] All ${n} tracks reached their daily test limit. Exiting.`;
 }
 
 function dayState(coord, today) {
@@ -429,118 +454,229 @@ function reason(e) {
   if (code) return `HTTP ${code}${e.detail ? ` ${e.detail}` : ''}`;
   const m = String((e && e.message) || e);
   if (/timeout|timed out/i.test(m)) return 'timeout';
-  return m.slice(0, 50);
+  return m.slice(0, 80);
 }
 
-async function playStream(acct, trackId, playMs) {
-  const startedAt = Date.now();
+async function consumeStreamBody(body, maxMs, signal) {
+  const reader = body.getReader();
+  const started = Date.now();
+  let bytes = 0;
+  let chunks = 0;
+  let ended = false;
+  let aborted = false;
+  let error = null;
+  try {
+    while (true) {
+      if (signal && signal.aborted) { aborted = true; break; }
+      const { done, value } = await reader.read();
+      if (done) { ended = true; break; }
+      if (!value || !value.length) continue;
+      bytes += value.length;
+      chunks++;
+      if (Date.now() - started >= maxMs) {
+        aborted = true;
+        if (signal) signal.abort();
+        break;
+      }
+    }
+  } catch (e) {
+    if (signal && signal.aborted) aborted = true;
+    else error = e;
+  } finally {
+    try { await reader.cancel(); } catch (_) {}
+  }
+  return { bytes, chunks, elapsedMs: Date.now() - started, ended, aborted, error };
+}
+
+async function playStream(acct, streamId, playMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
-  let reader = null;
-  let received = 0;
+  const startedAt = Date.now();
+  let httpStatus = null;
   try {
-    try {
-      const qs = new URLSearchParams({ user_id: acct.user_id, api_key: acct.app_data.api_key, app_name: 'stream' });
-      const res = await fetch(`${CFG.apiBase}/tracks/${trackId}/stream?${qs}`, {
-        headers: { Authorization: `Bearer ${acct.app_data.bearer_token}` },
-        redirect: 'manual',
-        signal: controller.signal,
-      });
-      if (res.status >= 300 && res.status < 400) throw new Error('redirect not followed (worker must follow it)');
-      if (!res.ok) {
-        let detail = '';
-        try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
-        throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, detail });
-      }
-      if (!res.body) throw new Error('empty stream response');
-      reader = res.body.getReader();
-      const first = await reader.read();
-      if (first.done || !first.value || !first.value.length) throw new Error('empty stream response');
-      received = first.value.length;
-    } catch (e) {
-      if (controller.signal.aborted) throw new Error(`timeout: stream request took longer than ${CFG.callTimeoutMs / 1000}s`);
-      throw e;
-    } finally {
-      clearTimeout(timer);
+    const qs = new URLSearchParams({
+      user_id: acct.user_id,
+      api_key: acct.app_data.api_key,
+      app_name: CFG.appName,
+    });
+    const res = await fetch(`${CFG.apiBase}/tracks/${encodeURIComponent(streamId)}/stream?${qs}`, {
+      headers: { Authorization: `Bearer ${acct.app_data.bearer_token}` },
+      redirect: 'manual',
+      signal: controller.signal,
+    });
+    httpStatus = res.status;
+    if (res.status >= 300 && res.status < 400) {
+      return {
+        ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt,
+        audioReceived: false, completed: false, interrupted: false,
+        error: new Error(`redirect not followed (HTTP ${res.status})`),
+      };
     }
-    const left = playMs - (Date.now() - startedAt);
-    if (left > 0) await sleep(left);
-    return received;
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
+      return {
+        ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt,
+        audioReceived: false, completed: false, interrupted: false,
+        error: Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, detail }),
+      };
+    }
+    if (!res.body) {
+      return {
+        ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt,
+        audioReceived: false, completed: false, interrupted: false,
+        error: new Error('empty stream response'),
+      };
+    }
+    const consume = await consumeStreamBody(res.body, playMs, controller.signal);
+    const audioReceived = consume.bytes > 0;
+    const completed = !consume.error && audioReceived && (consume.ended || consume.elapsedMs >= playMs * 0.9);
+    return {
+      ok: completed,
+      httpStatus,
+      bytes: consume.bytes,
+      chunks: consume.chunks,
+      elapsedMs: consume.elapsedMs,
+      audioReceived,
+      completed,
+      endedNaturally: consume.ended,
+      interrupted: !completed && audioReceived,
+      error: consume.error,
+    };
+  } catch (e) {
+    return {
+      ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt,
+      audioReceived: false, completed: false, interrupted: false,
+      error: e,
+    };
   } finally {
     clearTimeout(timer);
-    if (reader) await reader.cancel().catch(() => {});
     controller.abort();
   }
+}
+
+async function getTrackMeta(run, target) {
+  if (!run.meta.has(target.key)) {
+    const p = resolveTrackForStreaming(target);
+    run.meta.set(target.key, p);
+    p.catch(() => run.meta.delete(target.key));
+  }
+  return run.meta.get(target.key);
 }
 
 async function streamJob(sb, ctx, run, acct, target) {
   const st = run.stats;
   const who = acct.handle ? `@${acct.handle}` : acct.address;
   const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id} | ${text}`); };
-  let verified = false;
-  let outcome;
-  let stage = 'play';
+
+  let outcome = 'failed';
+  let playback = {
+    httpStatus: null, bytes: 0, elapsedMs: 0, audioReceived: false, completed: false,
+    interrupted: false, error: null, streamIdUsed: null, resolvedId: null,
+  };
   let playMs = CFG.streamDurationMs;
-  let received = 0;
 
   try {
     const sent = run.started.get(target.key) || 0;
     run.started.set(target.key, sent + 1);
     const ordinal = (run.todayDone.get(target.key) || 0) + sent + 1;
 
-    let streamId = target.id;
-    if (CFG.streamIdMode !== 'hash') {
-      stage = 'trackId';
-      if (!run.ids.has(target.key)) {
-        const p = getNumericId(target.id);
-        run.ids.set(target.key, p);
-        p.catch(() => run.ids.delete(target.key));
-      }
-      streamId = await run.ids.get(target.key);
-    }
+    const meta = await getTrackMeta(run, target);
+    playback.streamIdUsed = meta.streamId;
+    playback.resolvedId = meta.streamId;
 
     if (ordinal >= CFG.fullPlayAt) {
-      stage = 'trackInfo';
-      const durSec = await getDurationSec(target.id);
-      playMs = (durSec + 5) * 1000;
-      say(`playing full track (~${durSec}s)`);
+      playMs = (meta.duration + 5) * 1000;
+      say(`playing full track (~${meta.duration}s)`);
+    } else {
+      say(`playing ${Math.round(playMs / 1000)}s test window`);
     }
 
-    stage = 'play';
-    received = await playStream(acct, streamId, playMs);
+    playback = await playStream(acct, meta.streamId, playMs);
+    playback.streamIdUsed = meta.streamId;
+    playback.resolvedId = meta.streamId;
 
-    verified = true;
-    run.consecFail = 0;
-    outcome = 'ok';
-    st.ok++;
+    if (playback.completed) {
+      outcome = 'completed';
+      run.consecFail = 0;
+      st.ok++;
+      say(`completed: ${playback.bytes} bytes, ${Math.round(playback.elapsedMs / 1000)}s`);
+    } else if (playback.audioReceived) {
+      outcome = 'interrupted';
+      run.consecFail++;
+      st.interrupted++;
+      say(`interrupted after ${playback.bytes} bytes / ${Math.round(playback.elapsedMs / 1000)}s`);
+    } else {
+      outcome = 'failed';
+      run.consecFail++;
+      st.failed++;
+      say(`failed: ${reason(playback.error)}`);
+    }
+
+    if (!playback.completed && playback.error) {
+      const kind = classify(playback.error);
+      if (kind === 'rate') { st.rate++; say(`rate: ${reason(playback.error)}`); }
+      else if (kind === 'permanent') { st.perm++; run.cool.add(acct.address); say(`permanent: ${reason(playback.error)}`); }
+      else { st.retry++; say(`retryable: ${reason(playback.error)}`); }
+      const why = `${outcome}: ${reason(playback.error)}`;
+      run.reasons.set(why, (run.reasons.get(why) || 0) + 1);
+    } else if (!playback.completed) {
+      const why = `${outcome}: no audio received`;
+      run.reasons.set(why, (run.reasons.get(why) || 0) + 1);
+    }
+
+    if (run.consecFail >= CFG.failStopAfter && !run.stop) {
+      run.stop = true;
+      log('[!] Too many failures in a row; stopping. Next run resumes.');
+    }
   } catch (e) {
+    outcome = 'failed';
+    run.consecFail++;
+    st.failed++;
     const kind = classify(e);
-    const why = `${stage}: ${reason(e)}`;
+    if (kind === 'rate') st.rate++;
+    else if (kind === 'permanent') { st.perm++; run.cool.add(acct.address); }
+    else st.retry++;
+    const why = `exception: ${reason(e)}`;
     run.reasons.set(why, (run.reasons.get(why) || 0) + 1);
-    if (kind === 'rate') { outcome = 'rate'; st.rate++; say(why); }
-    else if (kind === 'permanent') { outcome = 'perm'; st.perm++; run.cool.add(acct.address); say(why); }
-    else { outcome = 'retry'; st.retry++; say(why); }
-    if (++run.consecFail >= CFG.failStopAfter && !run.stop) {
+    say(why);
+    if (run.consecFail >= CFG.failStopAfter && !run.stop) {
       run.stop = true;
       log('[!] Too many failures in a row; stopping. Next run resumes.');
     }
   }
 
-  if (verified) {
-    const item = {
-      address: acct.address, track_id: target.id, date: ctx.today, day: ctx.dayName, run_number: run.number,
-      week_start: ctx.weekStart, at: new Date().toISOString(),
-    };
-    let saved = true;
-    try { await recordStream(sb, ctx.weekStart, acct.address, item); } catch (e) {
-      saved = false;
-      PENDING.push(item); savePending();
-      if (e instanceof LockLostError) run.abort = e;
-    }
-    acct.today++;
-    if (!saved) log(`[!] ${who} -> track ${target.id} | streamed, DB save failed (kept locally)`);
-    else say(`streamed ${Math.round(playMs / 1000)}s (audio received)`);
+  const testId = crypto.randomUUID();
+  const item = {
+    test_id: testId,
+    address: acct.address,
+    track_id: target.id,
+    stream_id: playback.streamIdUsed || null,
+    resolved_id: playback.resolvedId || null,
+    date: ctx.today,
+    day: ctx.dayName,
+    run_number: run.number,
+    week_start: ctx.weekStart,
+    at: new Date().toISOString(),
+    result: outcome,
+    http_status: playback.httpStatus,
+    bytes: playback.bytes,
+    duration_ms: playback.elapsedMs,
+    audio_received: playback.audioReceived,
+    completed: playback.completed,
+    error: playback.error ? String(playback.error.message || playback.error).slice(0, 240) : null,
+  };
+
+  let saved = true;
+  try { await recordStream(sb, ctx.weekStart, acct.address, item); } catch (e) {
+    saved = false;
+    PENDING.push(item);
+    savePending();
+    if (e instanceof LockLostError) run.abort = e;
   }
+
+  if (outcome === 'completed') acct.today++;
+  if (!saved) log(`[!] ${who} -> track ${target.id} | test recorded locally (DB save failed)`);
 
   if (CFG.streamDelayMs) await sleep(CFG.streamDelayMs);
   return outcome;
@@ -571,7 +707,7 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
     started++;
     const outcome = await streamJob(sb, ctx, run, acct, target);
     inflight--;
-    if (outcome === 'ok') got++;
+    if (outcome === 'completed') got++;
     return true;
   };
   await Promise.all(Array.from({ length: Math.max(1, CFG.concurrency) }, async () => { while (await step()); }));
@@ -581,7 +717,10 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
 function countToday(raw, ctx) {
   let n = 0;
   if (isObj(raw) && raw.week_start === ctx.weekStart && Array.isArray(raw.runs)) {
-    for (const r of raw.runs) if (r.date === ctx.today) for (const t of (r.tracks || [])) if (t.status === 'success') n += t.count || 1;
+    for (const r of raw.runs) {
+      if (r.date !== ctx.today) continue;
+      for (const t of (r.tracks || [])) n += entryCount(t);
+    }
   }
   return n;
 }
@@ -594,9 +733,10 @@ function countTracks(rows, ctx, runNumber) {
     for (const x of f.runs) {
       if (x.date !== ctx.today || (runNumber !== undefined && x.run_number !== runNumber)) continue;
       for (const t of x.tracks || []) {
-        if (t.status !== 'success') continue;
+        const c = entryCount(t);
+        if (!c) continue;
         const k = String(t.track_id);
-        counts.set(k, (counts.get(k) || 0) + (t.count || 1));
+        counts.set(k, (counts.get(k) || 0) + c);
       }
     }
   }
@@ -611,19 +751,19 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   }));
   const reader = accounts.find(a => a.hasCreds);
   if (!reader) throw new Error('no account with complete credentials');
-  
+
   const targetAddrs = new Set(targets.map(p => p.address).filter(Boolean));
   const excluded = new Set(accounts.filter(a => targetAddrs.has(a.address)).map(a => a.address));
 
   const todayDone = countTracks(rows, ctx);
   const runDone = countTracks(rows, ctx, runNumber);
-  
+
   const need = new Map(targets.map(t => {
     const left = Math.max(0, t.cap - (todayDone.get(t.key) || 0));
     const attempts = Math.max(0, t.maxPerRun - (runDone.get(t.key) || 0));
     return [t.key, { attempts: left ? attempts : 0, maxOk: left }];
   }));
-  
+
   let totalNeed = 0;
   let active = 0;
   let activePrev = 0;
@@ -634,7 +774,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     active++;
     if (t.previous) activePrev++;
   }
-  
+
   if (!totalNeed) {
     if (!tracksBelowCap(rows, targets, ctx).length) {
       log(allDoneMsg(targets.length));
@@ -650,9 +790,9 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     log(`[*] Run ${runNumber}: nothing left to attempt in this run.`);
     return { status: 'COMPLETED' };
   }
-  
+
   const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
-  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do (${active - activePrev} today, ${activePrev} previous days)${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} streams.`);
+  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to test (${active - activePrev} today, ${activePrev} previous days)${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} playback tests.`);
 
   if (!batch) {
     await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
@@ -663,7 +803,11 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     });
   }
 
-  const run = { todayDone, started: new Map(), ids: new Map(), startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, reasons: new Map(), stats: { ok: 0, rate: 0, retry: 0, perm: 0 } };
+  const run = {
+    todayDone, started: new Map(), meta: new Map(), startedAt: Date.now(), number: runNumber,
+    cool: new Set(), abort: null, stop: false, consecFail: 0, reasons: new Map(),
+    stats: { ok: 0, interrupted: 0, failed: 0, rate: 0, retry: 0, perm: 0 },
+  };
   const st = run.stats;
   let incomplete = false;
 
@@ -679,9 +823,9 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const day = (todayDone.get(t.key) || 0) + got;
     const tag = t.previous ? ' [previous day]' : '';
     if (started < n.attempts && got < n.maxOk && !run.stop) {
-      log(`[!] track ${t.id}${tag} | ${day}/${t.cap} today (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
+      log(`[!] track ${t.id}${tag} | ${day}/${t.cap} completed tests today (no more accounts available${skipped ? `, ${skipped} not completed` : ''})`);
     } else {
-      log(`[*] track ${t.id}${tag} | ${day}/${t.cap} today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
+      log(`[*] track ${t.id}${tag} | ${day}/${t.cap} completed tests today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} not completed)` : ''}`);
     }
     if (run.stop) incomplete = true;
   }
@@ -699,10 +843,12 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const top = [...run.reasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k} x${n}`);
     log(`[!] Failure reasons: ${top.join(', ')}`);
   }
-  const parts = [`${st.ok} streamed`];
+  const parts = [`${st.ok} completed`];
+  if (st.interrupted) parts.push(`${st.interrupted} interrupted`);
+  if (st.failed) parts.push(`${st.failed} failed`);
   if (st.rate) parts.push(`${st.rate} rate-limited`);
-  if (st.retry) parts.push(`${st.retry} errors`);
-  if (st.perm) parts.push(`${st.perm} failed`);
+  if (st.retry) parts.push(`${st.retry} retryable errors`);
+  if (st.perm) parts.push(`${st.perm} permanent failures`);
   log(`[*] Run ${runNumber} ${left ? 'incomplete' : 'complete'}: ${parts.join(', ')}.${left ? ' Next run resumes.' : ''}`);
   return { status: left ? 'INCOMPLETE' : 'COMPLETED' };
 }
