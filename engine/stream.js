@@ -95,9 +95,11 @@ const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
   dailyPerTrack: Number(process.env.DAILY_STREAMS_PER_TRACK || 1000),
   dailyPerPreviousTrack: Number(process.env.DAILY_STREAMS_PER_PREVIOUS_TRACK || 200),
-  maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 100),
-  maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 5),
+  maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
+  maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
+  fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
+  streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
   runsPerDay: 2,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
@@ -235,7 +237,7 @@ function collectTracks(upTracks, today) {
       id, key: id, address: d.address || null, handle: typeof d.handle === 'string' ? d.handle : null,
       date: d.date, previous: !isToday, 
       cap: isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack,
-      maxPerRun: isToday ? CFG.maxStreamsPerRunToday : CFG.maxStreamsPerRunPrev
+      maxPerRun: (isToday ? CFG.maxStreamsPerRunToday : CFG.maxStreamsPerRunPrev) || Math.ceil((isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack) / CFG.runsPerDay)
     });
   }
   return [...seen.values()].sort((x, y) => (x.previous - y.previous) || (x.date < y.date ? 1 : x.date > y.date ? -1 : 0));
@@ -246,14 +248,6 @@ function normalizeStream(raw, weekStart) {
   const h = { week_start: weekStart, runs: [] };
   if (isObj(raw) && raw.lock) h.lock = raw.lock;
   return h;
-}
-
-function streamedSet(raw, weekStart) {
-  const s = new Set();
-  if (isObj(raw) && raw.week_start === weekStart && Array.isArray(raw.runs)) {
-    for (const r of raw.runs) for (const t of (r.tracks || [])) if (t.status === 'success') s.add(String(t.track_id));
-  }
-  return s;
 }
 
 let HELD_LOCK = null;
@@ -291,15 +285,18 @@ async function updateStream(sb, address, weekStart, mutate) {
 
 async function recordStream(sb, weekStart, address, f) {
   const key = String(f.track_id);
-  const has = h => h.runs.some(r => (r.tracks || []).some(t => String(t.track_id) === key && t.status === 'success'));
-  const stored = await updateStream(sb, address, weekStart, h => {
-    if (has(h)) return false;
+  await updateStream(sb, address, weekStart, h => {
     let run = h.runs.find(r => r.date === f.date && r.run_number === f.run_number);
     if (!run) { run = { date: f.date, day: f.day, run_number: f.run_number, tracks: [] }; h.runs.push(run); }
-    run.tracks.push({ track_id: key, status: 'success', streamed_at: f.at });
+    const entry = run.tracks.find(t => String(t.track_id) === key && t.status === 'success');
+    if (entry) {
+      entry.count = (entry.count || 1) + 1;
+      entry.streamed_at = f.at;
+    } else {
+      run.tracks.push({ track_id: key, status: 'success', count: 1, streamed_at: f.at });
+    }
     return true;
   });
-  if (!has(stored)) throw new Error(`database verification failed for ${address} -> ${key}`);
 }
 
 let PENDING = [];
@@ -421,59 +418,69 @@ function reason(e) {
   return m.slice(0, 50);
 }
 
-async function streamJob(sb, ctx, run, acct, target, todayDone) {
+async function playStream(url, playMs) {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
+  let reader = null;
+  try {
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+      if (!res.body) throw new Error('empty stream response');
+      reader = res.body.getReader();
+      const first = await reader.read();
+      if (first.done || !first.value || !first.value.length) throw new Error('empty stream response');
+    } catch (e) {
+      if (controller.signal.aborted) throw new Error(`timeout: stream request took longer than ${CFG.callTimeoutMs / 1000}s`);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+    const left = playMs - (Date.now() - startedAt);
+    if (left > 0) await sleep(left);
+  } finally {
+    clearTimeout(timer);
+    if (reader) await reader.cancel().catch(() => {});
+    controller.abort();
+  }
+}
+
+async function streamJob(sb, ctx, run, acct, target) {
   const st = run.stats;
   const who = acct.handle ? `@${acct.handle}` : acct.address;
   const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id} | ${text}`); };
   let verified = false;
-  let already = false;
   let outcome;
-  
+
   try {
     let sdk = run.sdks.get(acct.address);
     if (!sdk) { sdk = makeSdk(acct); run.sdks.set(acct.address, sdk); }
 
-    // Since we track streams in our own DB, we don't need to verify if they already streamed via API
-    if (acct.streamed.has(target.key)) {
-      already = true;
+    const streamRes = await withTimeout(sdk.tracks.streamTrack({ trackId: target.id, userId: acct.user_id }), CFG.callTimeoutMs, 'streamTrack');
+    const streamUrl = typeof streamRes === 'string' ? streamRes : streamRes && (streamRes.data || streamRes.url);
+    if (typeof streamUrl !== 'string' || !streamUrl) throw new Error('No stream URL returned');
+
+    const sent = run.started.get(target.key) || 0;
+    run.started.set(target.key, sent + 1);
+    const ordinal = (run.todayDone.get(target.key) || 0) + sent + 1;
+
+    let playMs = CFG.streamDurationMs;
+    if (ordinal >= CFG.fullPlayAt) {
+      const info = await withTimeout(sdk.tracks.getTrack({ trackId: target.id }), CFG.callTimeoutMs, 'getTrack');
+      const durSec = (info && info.data && info.data.duration) || 180;
+      playMs = (durSec + 5) * 1000;
+      say(`playing full track (~${durSec}s)`);
     } else {
-      // 1. Get Stream URL
-      const streamRes = await withTimeout(sdk.tracks.streamTrack({ trackId: target.id }), CFG.callTimeoutMs, 'streamTrack');
-      const streamUrl = streamRes.data || streamRes.url;
-      if (!streamUrl) throw new Error('No stream URL returned');
-
-      // 2. Determine duration
-      const currentTotal = (todayDone.get(target.key) || 0) + (st.ok + st.already);
-      let playMs = CFG.streamDurationMs;
-      
-      // If this is the 100th stream (or beyond), play the whole track.
-      if (currentTotal >= 100) {
-        // Fetch track info to get the actual duration
-        const trackInfo = await withTimeout(sdk.tracks.getTrack({ trackId: target.id }), CFG.callTimeoutMs, 'getTrack');
-        const durSec = trackInfo.data?.duration || 180;
-        playMs = (durSec + 5) * 1000; // Add 5s buffer
-        say(`playing full track (~${durSec}s)`);
-      } else {
-        say(`playing 20s`);
-      }
-
-      // 3. Stream it
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), playMs);
-      try {
-        await withTimeout(fetch(streamUrl, { signal: controller.signal }), playMs + 10000, 'streamData');
-      } catch (e) {
-        if (e.name !== 'AbortError' && !e.message.includes('timeout')) throw e;
-        // AbortError means we successfully hit our 20s limit and aborted.
-      } finally {
-        clearTimeout(timeout);
-      }
+      say(`playing ${Math.round(playMs / 1000)}s`);
     }
+
+    await playStream(streamUrl, playMs);
 
     verified = true;
     run.consecFail = 0;
-    outcome = already ? 'already' : 'ok';
-    already ? st.already++ : st.ok++;
+    outcome = 'ok';
+    st.ok++;
   } catch (e) {
     const kind = classify(e);
     if (kind === 'rate') { outcome = 'rate'; st.rate++; say('429'); }
@@ -484,7 +491,7 @@ async function streamJob(sb, ctx, run, acct, target, todayDone) {
       log('[!] Too many failures in a row; stopping. Next run resumes.');
     }
   }
-  
+
   if (verified) {
     const item = {
       address: acct.address, track_id: target.id, date: ctx.today, day: ctx.dayName, run_number: run.number,
@@ -496,13 +503,12 @@ async function streamJob(sb, ctx, run, acct, target, todayDone) {
       PENDING.push(item); savePending();
       if (e instanceof LockLostError) run.abort = e;
     }
-    acct.streamed.add(target.key);
     acct.today++;
     if (!saved) log(`[!] ${who} -> track ${target.id} | streamed, DB save failed (kept locally)`);
-    else say(already ? 'already streamed' : 'successful');
+    else say('successful');
   }
-  
-  if (CFG.favoriteDelayMs) await sleep(CFG.favoriteDelayMs);
+
+  if (CFG.streamDelayMs) await sleep(CFG.streamDelayMs);
   return outcome;
 }
 
@@ -510,9 +516,6 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let got = 0;
   let inflight = 0;
   let started = 0;
-  
-  // We need to pass todayDone to streamJob for the 100-stream rule
-  const todayDone = countTracks(run.rows, ctx); 
 
   const step = async () => {
     if (run.abort || LOCK_LOST || run.stop) return false;
@@ -527,13 +530,14 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
       await sleep(50);
       return true;
     }
-    const acct = candidates.shift();
+    let acct = candidates.shift();
+    while (acct && run.cool.has(acct.address)) acct = candidates.shift();
     if (!acct) return false;
     inflight++;
     started++;
-    const outcome = await streamJob(sb, ctx, run, acct, target, todayDone);
+    const outcome = await streamJob(sb, ctx, run, acct, target);
     inflight--;
-    if (outcome === 'ok' || outcome === 'already') got++;
+    if (outcome === 'ok') got++;
     return true;
   };
   await Promise.all(Array.from({ length: Math.max(1, CFG.concurrency) }, async () => { while (await step()); }));
@@ -543,7 +547,7 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
 function countToday(raw, ctx) {
   let n = 0;
   if (isObj(raw) && raw.week_start === ctx.weekStart && Array.isArray(raw.runs)) {
-    for (const r of raw.runs) if (r.date === ctx.today) n += (r.tracks || []).filter(t => t.status === 'success').length;
+    for (const r of raw.runs) if (r.date === ctx.today) for (const t of (r.tracks || [])) if (t.status === 'success') n += t.count || 1;
   }
   return n;
 }
@@ -558,7 +562,7 @@ function countTracks(rows, ctx, runNumber) {
       for (const t of x.tracks || []) {
         if (t.status !== 'success') continue;
         const k = String(t.track_id);
-        counts.set(k, (counts.get(k) || 0) + 1);
+        counts.set(k, (counts.get(k) || 0) + (t.count || 1));
       }
     }
   }
@@ -568,7 +572,7 @@ function countTracks(rows, ctx, runNumber) {
 async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   const accounts = rows.map(r => ({
     address: r.address, handle: typeof r.handle === 'string' ? r.handle.trim().replace(/^@/, '') : null,
-    user_id: r.user_id, app_data: r.app_data, hasCreds: hasCreds(r), streamed: streamedSet(r.stream, ctx.weekStart),
+    user_id: r.user_id, app_data: r.app_data, hasCreds: hasCreds(r),
     today: countToday(r.stream, ctx),
   }));
   const reader = accounts.find(a => a.hasCreds);
@@ -582,7 +586,6 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   
   const need = new Map(targets.map(t => {
     const left = Math.max(0, t.cap - (todayDone.get(t.key) || 0));
-    // Attempts per run is now strict based on maxPerRun
     const attempts = Math.max(0, t.maxPerRun - (runDone.get(t.key) || 0));
     return [t.key, { attempts: left ? attempts : 0, maxOk: left }];
   }));
@@ -626,7 +629,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     });
   }
 
-  const run = { rows, startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, sdks: new Map(), stats: { ok: 0, already: 0, rate: 0, retry: 0, perm: 0 } };
+  const run = { todayDone, started: new Map(), startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, lastReqErr: null, sdks: new Map(), stats: { ok: 0, rate: 0, retry: 0, perm: 0 } };
   const st = run.stats;
   let incomplete = false;
 
@@ -634,8 +637,9 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const n = need.get(t.key);
     if (!n.attempts) continue;
     if (run.stop) { incomplete = true; continue; }
-    const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !a.streamed.has(t.key) && !run.cool.has(a.address));
-    const candidates = shuffle(pool).sort((x, y) => x.today - y.today);
+    const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !run.cool.has(a.address));
+    const order = shuffle(pool).sort((x, y) => x.today - y.today);
+    const candidates = order.length ? Array.from({ length: n.attempts }, (_, i) => order[i % order.length]) : [];
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     const day = (todayDone.get(t.key) || 0) + got;
@@ -658,7 +662,6 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     });
   }
   const parts = [`${st.ok} streamed`];
-  if (st.already) parts.push(`${st.already} already streamed`);
   if (st.rate) parts.push(`${st.rate} rate-limited`);
   if (st.retry) parts.push(`${st.retry} errors`);
   if (st.perm) parts.push(`${st.perm} failed`);
