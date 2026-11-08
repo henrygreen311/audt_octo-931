@@ -53,6 +53,7 @@ const CFG = {
   assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
+  playLogThresholdMs: Number(process.env.PLAY_LOG_THRESHOLD_MS || 5000),
 };
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -101,6 +102,7 @@ async function withRetry(fn, retryIf = isTransient, tries = CFG.retries) {
   }
   throw lastErr;
 }
+
 function withTimeout(promise, ms = CFG.callTimeoutMs, what = 'request') {
   let t;
   const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`timeout: ${what} took longer than ${ms / 1000}s`)), ms); });
@@ -409,6 +411,33 @@ async function readChunk(reader, ms) {
   }
 }
 
+/**
+ * Explicitly logs a track play by sending a POST request to the stream endpoint.
+ * This acts as a secondary confirmation in addition to the GET stream request.
+ */
+async function logTrackPlay(acct, streamId) {
+  try {
+    const qs = new URLSearchParams({
+      user_id: acct.user_id,
+      api_key: acct.app_data.api_key,
+      app_name: 'stream',
+    });
+    const res = await withTimeout(
+      fetch(`${CFG.apiBase}/tracks/${encodeURIComponent(streamId)}/stream?${qs}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${acct.app_data.bearer_token}` },
+      }),
+      CFG.callTimeoutMs,
+      'logTrackPlay'
+    );
+    if (!res.ok) {
+      log(`[!] Play log for track ${streamId} returned HTTP ${res.status}`);
+    }
+  } catch (e) {
+    log(`[!] Play log failed for track ${streamId}: ${e.message}`);
+  }
+}
+
 async function playStream(acct, streamId, playMs, durationSec) {
   const controller = new AbortController();
   const connectTimer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
@@ -473,6 +502,10 @@ async function playStream(acct, streamId, playMs, durationSec) {
     } else if (bytes < rate * (playMs / 1000) * 0.9) {
       throw interrupted(`only ${Math.round(bytes / 1024)} of ${Math.round((rate * playMs) / 1000 / 1024)} KB delivered in ${Math.round(wallMs / 1000)}s`);
     }
+
+    // Explicitly log the play after a successful playback window
+    await logTrackPlay(acct, streamId);
+
     return { bytes, wallMs, playbackMs: Math.min(mediaMs, wallMs), ended, status: res.status, contentType: res.headers.get('content-type') || 'unknown', url: `/v1/tracks/${streamId}/stream` };
   } finally {
     clearTimeout(connectTimer);
