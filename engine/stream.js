@@ -427,6 +427,7 @@ async function playStream(acct, trackId, playMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
   let reader = null;
+  let received = 0;
   try {
     try {
       const qs = new URLSearchParams({ user_id: acct.user_id, api_key: acct.app_data.api_key, app_name: 'stream' });
@@ -435,17 +436,17 @@ async function playStream(acct, trackId, playMs) {
         redirect: 'manual',
         signal: controller.signal,
       });
-      if (!(res.status >= 300 && res.status < 400)) {
-        if (!res.ok) {
-          let detail = '';
-          try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
-          throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, detail });
-        }
-        if (!res.body) throw new Error('empty stream response');
-        reader = res.body.getReader();
-        const first = await reader.read();
-        if (first.done || !first.value || !first.value.length) throw new Error('empty stream response');
+      if (res.status >= 300 && res.status < 400) throw new Error('redirect not followed (worker must follow it)');
+      if (!res.ok) {
+        let detail = '';
+        try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
+        throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, detail });
       }
+      if (!res.body) throw new Error('empty stream response');
+      reader = res.body.getReader();
+      const first = await reader.read();
+      if (first.done || !first.value || !first.value.length) throw new Error('empty stream response');
+      received = first.value.length;
     } catch (e) {
       if (controller.signal.aborted) throw new Error(`timeout: stream request took longer than ${CFG.callTimeoutMs / 1000}s`);
       throw e;
@@ -454,6 +455,7 @@ async function playStream(acct, trackId, playMs) {
     }
     const left = playMs - (Date.now() - startedAt);
     if (left > 0) await sleep(left);
+    return received;
   } finally {
     clearTimeout(timer);
     if (reader) await reader.cancel().catch(() => {});
@@ -469,6 +471,7 @@ async function streamJob(sb, ctx, run, acct, target) {
   let outcome;
   let stage = 'play';
   let playMs = CFG.streamDurationMs;
+  let received = 0;
 
   try {
     const sent = run.started.get(target.key) || 0;
@@ -483,7 +486,7 @@ async function streamJob(sb, ctx, run, acct, target) {
     }
 
     stage = 'play';
-    await playStream(acct, target.id, playMs);
+    received = await playStream(acct, target.id, playMs);
 
     verified = true;
     run.consecFail = 0;
@@ -515,7 +518,7 @@ async function streamJob(sb, ctx, run, acct, target) {
     }
     acct.today++;
     if (!saved) log(`[!] ${who} -> track ${target.id} | streamed, DB save failed (kept locally)`);
-    else say(`streamed ${Math.round(playMs / 1000)}s`);
+    else say(`streamed ${Math.round(playMs / 1000)}s (audio received)`);
   }
 
   if (CFG.streamDelayMs) await sleep(CFG.streamDelayMs);
