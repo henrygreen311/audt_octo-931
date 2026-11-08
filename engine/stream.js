@@ -7,49 +7,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
-const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS || 'https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev')
-  .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
-const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
-{
-  const realFetch = globalThis.fetch;
-  const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
-  const downUntil = new Map();
-  const warned = new Set();
-  const ATTEMPTS = Number(process.env.PROXY_ATTEMPTS || 6);
-  const pick = () => {
-    const now = Date.now();
-    const up = PROXY_URLS.filter(u => (downUntil.get(u) || 0) <= now);
-    const pool = up.length ? up : PROXY_URLS;
-    return pool[Math.floor(Math.random() * pool.length)];
-  };
-  console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
-  globalThis.fetch = async (input, init) => {
-    const isReq = typeof input === 'object' && input !== null && 'url' in input;
-    let url;
-    try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
-    if (url.hostname !== 'api.audius.co') return realFetch(input, init);
-    const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
-    if (PROXY_KEY) headers.set('x-proxy-key', PROXY_KEY);
-    let lastErr;
-    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-      const proxy = pick();
-      const target = proxy + url.pathname + url.search;
-      try {
-        return isReq && !init
-          ? await realFetch(new Request(target, input.clone()), { headers })
-          : await realFetch(target, { ...init, headers });
-      } catch (e) {
-        const code = e && ((e.cause && e.cause.code) || e.code);
-        if (!CONNECT_ERRS.has(code)) throw e;
-        lastErr = e;
-        downUntil.set(proxy, Date.now() + 20000);
-        if (!warned.has(proxy)) { warned.add(proxy); console.log(`[!] Proxy ${new URL(proxy).host} unreachable; using another.`); }
-        await new Promise(r => setTimeout(r, 300 * attempt));
-      }
-    }
-    throw lastErr;
-  };
-}
+console.log('[*] Route: direct');
 
 const log = console.log.bind(console);
 const VERBOSE = process.env.VERBOSE === undefined ? !process.argv.includes('--quiet') : /^(1|true|yes)$/i.test(process.env.VERBOSE) || process.argv.includes('--verbose') || process.argv.includes('-v');
@@ -376,10 +334,8 @@ async function apiGet(pathname, params, what, headers = {}) {
   try {
     const res = await fetch(`${CFG.apiBase}${pathname}?${new URLSearchParams(params)}`, {
       headers: { Accept: 'application/json', ...headers },
-      redirect: 'manual',
       signal: controller.signal,
     });
-    if (res.status >= 300 && res.status < 400) return { redirect: res.headers.get('location') };
     if (!res.ok) {
       let detail = '';
       try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
@@ -466,7 +422,6 @@ async function playStream(acct, streamId, playMs, durationSec) {
       const qs = new URLSearchParams({ user_id: acct.user_id, api_key: acct.app_data.api_key, app_name: 'stream' });
       res = await fetch(`${CFG.apiBase}/tracks/${streamId}/stream?${qs}`, {
         headers: { Authorization: `Bearer ${acct.app_data.bearer_token}` },
-        redirect: 'manual',
         signal: controller.signal,
       });
     } catch (e) {
@@ -475,7 +430,6 @@ async function playStream(acct, streamId, playMs, durationSec) {
     } finally {
       clearTimeout(connectTimer);
     }
-    if (res.status >= 300 && res.status < 400) throw new Error('redirect not followed (worker must follow it)');
     if (!res.ok) {
       let detail = '';
       try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
