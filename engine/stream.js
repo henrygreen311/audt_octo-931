@@ -37,7 +37,7 @@ const CFG = {
   dailyPerPreviousTrack: Number(process.env.DAILY_STREAMS_PER_PREVIOUS_TRACK || 200),
   maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
   maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
-  streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
+  streamDurationMs: Number(process.env.STREAM_DURATION_MS || 60000),
   streamIdMode: (process.env.STREAM_ID || 'numeric').toLowerCase(),
   apiBase: process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1',
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
