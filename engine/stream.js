@@ -80,7 +80,7 @@ const CFG = {
   maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
   maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
-  streamIdMode: (process.env.STREAM_ID || 'numeric').toLowerCase(), // deprecated; kept for env compatibility
+  streamIdMode: (process.env.STREAM_ID || 'numeric').toLowerCase(),
   apiBase: process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1',
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
@@ -460,20 +460,28 @@ function reason(e) {
 async function consumeStreamBody(body, maxMs, signal) {
   const reader = body.getReader();
   const started = Date.now();
+  let firstByteAt = null;
+  let lastByteAt = null;
   let bytes = 0;
   let chunks = 0;
   let ended = false;
   let aborted = false;
   let error = null;
+
   try {
     while (true) {
       if (signal && signal.aborted) { aborted = true; break; }
       const { done, value } = await reader.read();
       if (done) { ended = true; break; }
       if (!value || !value.length) continue;
+
+      const now = Date.now();
+      if (firstByteAt === null) firstByteAt = now;
+      lastByteAt = now;
       bytes += value.length;
       chunks++;
-      if (Date.now() - started >= maxMs) {
+
+      if (now - started >= maxMs) {
         aborted = true;
         if (signal) signal.abort();
         break;
@@ -485,14 +493,20 @@ async function consumeStreamBody(body, maxMs, signal) {
   } finally {
     try { await reader.cancel(); } catch (_) {}
   }
-  return { bytes, chunks, elapsedMs: Date.now() - started, ended, aborted, error };
+
+  const elapsedMs = Date.now() - started;
+  const playbackMs = (firstByteAt !== null && lastByteAt !== null) ? (lastByteAt - firstByteAt) : 0;
+
+  return { bytes, chunks, elapsedMs, playbackMs, firstByteAt, lastByteAt, ended, aborted, error };
 }
 
-async function playStream(acct, streamId, playMs) {
+async function playStream(acct, streamId, playMs, trackDurationSec = 0) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
+  const timerMs = playMs + 15000; // Give full play the needed time + buffer
+  const timer = setTimeout(() => controller.abort(), timerMs);
   const startedAt = Date.now();
   let httpStatus = null;
+
   try {
     const qs = new URLSearchParams({
       user_id: acct.user_id,
@@ -505,10 +519,12 @@ async function playStream(acct, streamId, playMs) {
       signal: controller.signal,
     });
     httpStatus = res.status;
+
     if (res.status >= 300 && res.status < 400) {
       return {
-        ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt,
-        audioReceived: false, completed: false, interrupted: false,
+        ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt, playbackMs: 0,
+        audioReceived: false, completed: false, endedNaturally: false, interrupted: false,
+        requiredPlayMs: 0,
         error: new Error(`redirect not followed (HTTP ${res.status})`),
       };
     }
@@ -516,37 +532,62 @@ async function playStream(acct, streamId, playMs) {
       let detail = '';
       try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
       return {
-        ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt,
-        audioReceived: false, completed: false, interrupted: false,
+        ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt, playbackMs: 0,
+        audioReceived: false, completed: false, endedNaturally: false, interrupted: false,
+        requiredPlayMs: 0,
         error: Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, detail }),
       };
     }
     if (!res.body) {
       return {
-        ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt,
-        audioReceived: false, completed: false, interrupted: false,
+        ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt, playbackMs: 0,
+        audioReceived: false, completed: false, endedNaturally: false, interrupted: false,
+        requiredPlayMs: 0,
         error: new Error('empty stream response'),
       };
     }
+
     const consume = await consumeStreamBody(res.body, playMs, controller.signal);
     const audioReceived = consume.bytes > 0;
-    const completed = !consume.error && audioReceived && (consume.ended || consume.elapsedMs >= playMs * 0.9);
+
+    const isFullPlay = trackDurationSec > 0 && playMs >= trackDurationSec * 1000 - 1000;
+
+    let requiredPlayMs;
+    let playedLongEnough;
+
+    if (isFullPlay) {
+      const minBytes = Math.max(trackDurationSec * 4000, 100000);
+      requiredPlayMs = trackDurationSec * 1000 * 0.9;
+      const enoughBytes = consume.bytes >= minBytes;
+      const playedEnough = consume.ended || consume.playbackMs >= requiredPlayMs;
+      playedLongEnough = enoughBytes && playedEnough;
+    } else {
+      requiredPlayMs = playMs * 0.9;
+      playedLongEnough = consume.playbackMs >= requiredPlayMs;
+    }
+
+    const completed = !consume.error && audioReceived && playedLongEnough;
+    const interrupted = !completed && audioReceived;
+
     return {
       ok: completed,
       httpStatus,
       bytes: consume.bytes,
       chunks: consume.chunks,
       elapsedMs: consume.elapsedMs,
+      playbackMs: consume.playbackMs,
       audioReceived,
       completed,
       endedNaturally: consume.ended,
-      interrupted: !completed && audioReceived,
+      interrupted,
+      requiredPlayMs,
       error: consume.error,
     };
   } catch (e) {
     return {
-      ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt,
-      audioReceived: false, completed: false, interrupted: false,
+      ok: false, httpStatus, bytes: 0, elapsedMs: Date.now() - startedAt, playbackMs: 0,
+      audioReceived: false, completed: false, endedNaturally: false, interrupted: false,
+      requiredPlayMs: 0,
       error: e,
     };
   } finally {
@@ -571,8 +612,8 @@ async function streamJob(sb, ctx, run, acct, target) {
 
   let outcome = 'failed';
   let playback = {
-    httpStatus: null, bytes: 0, elapsedMs: 0, audioReceived: false, completed: false,
-    interrupted: false, error: null, streamIdUsed: null, resolvedId: null,
+    httpStatus: null, bytes: 0, elapsedMs: 0, playbackMs: 0, audioReceived: false, completed: false,
+    interrupted: false, error: null, streamIdUsed: null, resolvedId: null, requiredPlayMs: 0,
   };
   let playMs = CFG.streamDurationMs;
 
@@ -592,7 +633,7 @@ async function streamJob(sb, ctx, run, acct, target) {
       say(`playing ${Math.round(playMs / 1000)}s test window`);
     }
 
-    playback = await playStream(acct, meta.streamId, playMs);
+    playback = await playStream(acct, meta.streamId, playMs, meta.duration);
     playback.streamIdUsed = meta.streamId;
     playback.resolvedId = meta.streamId;
 
@@ -600,12 +641,12 @@ async function streamJob(sb, ctx, run, acct, target) {
       outcome = 'completed';
       run.consecFail = 0;
       st.ok++;
-      say(`completed: ${playback.bytes} bytes, ${Math.round(playback.elapsedMs / 1000)}s`);
+      say(`completed: ${playback.bytes} bytes over ${Math.round(playback.playbackMs / 1000)}s playback (required ${Math.round(playback.requiredPlayMs / 1000)}s)`);
     } else if (playback.audioReceived) {
       outcome = 'interrupted';
       run.consecFail++;
       st.interrupted++;
-      say(`interrupted after ${playback.bytes} bytes / ${Math.round(playback.elapsedMs / 1000)}s`);
+      say(`interrupted: ${playback.bytes} bytes over ${Math.round(playback.playbackMs / 1000)}s playback (required ${Math.round(playback.requiredPlayMs / 1000)}s)`);
     } else {
       outcome = 'failed';
       run.consecFail++;
@@ -662,6 +703,8 @@ async function streamJob(sb, ctx, run, acct, target) {
     http_status: playback.httpStatus,
     bytes: playback.bytes,
     duration_ms: playback.elapsedMs,
+    playback_ms: playback.playbackMs || 0,
+    required_ms: playback.requiredPlayMs || 0,
     audio_received: playback.audioReceived,
     completed: playback.completed,
     error: playback.error ? String(playback.error.message || playback.error).slice(0, 240) : null,
