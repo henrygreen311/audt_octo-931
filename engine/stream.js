@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
+const STREAM_DURATION_MS = 40000;
+
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -97,7 +99,7 @@ const CFG = {
   dailyPerPreviousTrack: Number(process.env.DAILY_STREAMS_PER_PREVIOUS_TRACK || 200),
   maxStreamsPerRunToday: Number(process.env.MAX_STREAMS_PER_RUN_TODAY || 0),
   maxStreamsPerRunPrev: Number(process.env.MAX_STREAMS_PER_RUN_PREV || 0),
-  streamDurationMs: Number(process.env.STREAM_DURATION_MS || 20000),
+  streamDurationMs: Number(process.env.STREAM_DURATION_MS || STREAM_DURATION_MS),
   fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
   runsPerDay: 2,
