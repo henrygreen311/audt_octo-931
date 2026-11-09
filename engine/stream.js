@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-const STREAM_DURATION_MS = 60000;
+const STREAM_DURATION_MS = 40000;
 
 const fs = require('fs');
 const os = require('os');
