@@ -3,7 +3,9 @@
 main.py - Root module runner.
 Usage: python3 main.py                run the full pipeline, one script after another
        python3 main.py <script>       run only one script from /engine
+       python3 main.py <script> <args>   run one script with extra arguments
 Example: python3 main.py follower.js
+         python3 main.py follower.js id=2     (follower booster, runs until stopped)
          python3 main.py repost.js
 """
 
@@ -22,6 +24,17 @@ STREAM_ENABLED = True
 # Set to False to completely mute stream.js logs (it will still run silently)
 STREAM_SHOW_LOGS = True
 
+# Set to True to run "follower.js id=2" (follower booster) in the background.
+# It starts only after the normal follower.js step of the pipeline has finished (so the
+# two never run at the same time) and is stopped as soon as stream.js completes.
+BOOST_ENABLED = True
+
+# Set to False to completely mute the follower.js id=2 logs (it will still run silently)
+BOOST_SHOW_LOGS = True
+
+# Prefix added to every follower.js id=2 log line so it is easy to tell apart ("" to disable)
+BOOST_LOG_PREFIX = "[boost] "
+
 # Set to False to completely mute the main pipeline logs (upload, follower, etc.)
 PIPELINE_SHOW_LOGS = False
 
@@ -34,7 +47,7 @@ PIPELINE = [
 ]
 # =====================================================================
 
-async def stream_reader(stream, is_stderr=False, silent=False):
+async def stream_reader(stream, is_stderr=False, silent=False, prefix=""):
     """Reads stdout/stderr from the subprocess line-by-line and prints immediately."""
     while True:
         line = await stream.readline()
@@ -53,13 +66,14 @@ async def stream_reader(stream, is_stderr=False, silent=False):
             continue
 
         if is_stderr:
-            print(text, file=sys.stderr, flush=True)
+            print(prefix + text, file=sys.stderr, flush=True)
         else:
-            print(text, flush=True)
+            print(prefix + text, flush=True)
 
-async def run_module(module_name: str, silent: bool = False) -> int:
+async def run_module(module_name: str, silent: bool = False, args=None, holder=None, prefix: str = "") -> int:
+    args = args or []
     if not silent:
-        print(f"[*] Loading module: {module_name}", flush=True)
+        print(f"{prefix}[*] Loading module: {module_name}" + (f" {' '.join(args)}" if args else ""), flush=True)
 
     if module_name.endswith(".js"):
         js_path = ROOT_DIR / "engine" / module_name
@@ -71,24 +85,31 @@ async def run_module(module_name: str, silent: bool = False) -> int:
         env = {**os.environ, "NODE_NO_WARNINGS": "1"}
 
         proc = await asyncio.create_subprocess_exec(
-            "node", str(js_path),
+            "node", str(js_path), *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env
         )
+        if holder is not None:
+            holder["proc"] = proc
 
         try:
             await asyncio.gather(
-                stream_reader(proc.stdout, is_stderr=False, silent=silent),
-                stream_reader(proc.stderr, is_stderr=True, silent=silent)
+                stream_reader(proc.stdout, is_stderr=False, silent=silent, prefix=prefix),
+                stream_reader(proc.stderr, is_stderr=True, silent=silent, prefix=prefix)
             )
             code = await proc.wait()
         finally:
             if proc.returncode is None:
                 proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except BaseException:
+                    proc.kill()
 
-        if code != 0 and not silent:
-            print(f"[!] {module_name} exited with code {code}", flush=True)
+        stopping = bool(holder and holder.get("stopping"))
+        if code != 0 and not silent and not stopping:
+            print(f"{prefix}[!] {module_name} exited with code {code}", flush=True)
         return code
 
     try:
@@ -108,12 +129,64 @@ async def run_module(module_name: str, silent: bool = False) -> int:
         print(f"[!] Module '{module_name}' does not have a 'run()' function.", flush=True)
     return 1
 
+async def stop_background(task, holder, label: str, show: bool):
+    """Stops a background module (SIGTERM, then SIGKILL after 10s) and waits for it to exit."""
+    proc = holder.get("proc")
+    if proc is not None and proc.returncode is None:
+        holder["stopping"] = True
+        if show:
+            print(f"[*] Stopping {label}...", flush=True)
+        proc.terminate()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+    try:
+        await task
+    except Exception:
+        pass
+
+async def stop_when_done(stream_task, boost_task, holder, show: bool):
+    """Stops the follower booster the moment stream.js completes (success or failure)."""
+    try:
+        await stream_task
+    except Exception:
+        pass
+    await stop_background(boost_task, holder, "follower.js id=2", show)
+
+def start_boost(stream_task, holder):
+    """Starts follower.js id=2 in the background (unless stream.js has already completed)."""
+    if stream_task is not None and stream_task.done():
+        if BOOST_SHOW_LOGS:
+            print("[*] stream.js already completed; follower.js id=2 not started.", flush=True)
+        return None, None
+
+    if BOOST_SHOW_LOGS:
+        print(f"[*] Starting follower.js id=2 in the background...", flush=True)
+
+    task = asyncio.create_task(
+        run_module("follower.js", silent=not BOOST_SHOW_LOGS, args=["id=2"],
+                   holder=holder, prefix=BOOST_LOG_PREFIX)
+    )
+
+    # When stream.js completes, main.py exits follower.js id=2 right away
+    stopper = None
+    if stream_task is not None:
+        stopper = asyncio.create_task(stop_when_done(stream_task, task, holder, BOOST_SHOW_LOGS))
+    return task, stopper
+
 async def run_pipeline():
     failed = []
     stream_task = None
+    boost_task = None
+    boost_stopper = None
+    boost_holder = {}
+    boost_started = False
     
     # Determine if the pipeline should be silent based on the toggle
     pipeline_silent = not PIPELINE_SHOW_LOGS
+
+    follower_step_enabled = any(n == "follower.js" and en for n, en in PIPELINE)
 
     for name, enabled in PIPELINE:
         if not enabled:
@@ -133,10 +206,21 @@ async def run_pipeline():
                 run_module("stream.js", silent=not STREAM_SHOW_LOGS)
             )
 
+        # With the normal follower.js step disabled there is nothing to conflict with,
+        # so the booster can start right away
+        if BOOST_ENABLED and not boost_started and not follower_step_enabled:
+            boost_started = True
+            boost_task, boost_stopper = start_boost(stream_task, boost_holder)
+
         # Run the main pipeline module (blocks until finished)
         code = await run_module(name, silent=pipeline_silent)
         if code != 0:
             failed.append(name)
+
+        # Normal follower.js has completed: now it is safe to start follower.js id=2
+        if name == "follower.js" and BOOST_ENABLED and not boost_started:
+            boost_started = True
+            boost_task, boost_stopper = start_boost(stream_task, boost_holder)
 
     # Wait for the background stream.js to finish before exiting entirely
     if stream_task:
@@ -156,6 +240,13 @@ async def run_pipeline():
             if not pipeline_silent or STREAM_SHOW_LOGS:
                 print(f"[!] Error in background stream.js: {e}", flush=True)
 
+    # stream.js is done (or was never started): make sure the follower booster is stopped
+    if boost_task:
+        if boost_stopper:
+            await boost_stopper
+        else:
+            await stop_background(boost_task, boost_holder, "follower.js id=2", BOOST_SHOW_LOGS)
+
     if failed and not pipeline_silent:
         print(f"[!] Pipeline finished with errors in: {', '.join(failed)}", flush=True)
 
@@ -167,7 +258,10 @@ def resolve_name(name: str) -> str:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if not args:
-        asyncio.run(run_pipeline())
-    else:
-        asyncio.run(run_module(resolve_name(args[0])))
+    try:
+        if not args:
+            asyncio.run(run_pipeline())
+        else:
+            asyncio.run(run_module(resolve_name(args[0]), args=args[1:]))
+    except KeyboardInterrupt:
+        print("\n[*] Stopped.", flush=True)

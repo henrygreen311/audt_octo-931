@@ -7,7 +7,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
-const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS || 'https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev')
+const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS || 'https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev,https://audius-v2.qringgreen.workers.dev,https://audius-v2.qring99.workers.dev,https://audius.henrygreen311.workers.dev,https://audius-v2.henrygreen311.workers.dev')
   .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
 {
@@ -719,11 +719,218 @@ async function runFollower({ now = new Date() } = {}) {
   }
 }
 
+const BOOST = {
+  targetFollowers: Number(process.env.BOOST_TARGET_FOLLOWERS || 50),
+  maxFollowers: Number(process.env.BOOST_MAX_FOLLOWERS || 100),
+  batchSize: Number(process.env.BOOST_BATCH_SIZE || 5),
+  waitMs: Number(process.env.BOOST_WAIT_MINUTES || 2) * 60000,
+  countBatch: 50,
+};
+
+async function fetchBoostAccounts(sb) {
+  const out = [];
+  const page = 1000;
+  for (let from = 0; ; from += page) {
+    const data = await withRetry(async () => {
+      const { data, error } = await sb.from('audius').select('address, handle, user_id, app_data')
+        .order('address', { ascending: true }).range(from, from + page - 1);
+      if (error) throw new Error(error.message);
+      return data || [];
+    });
+    out.push(...data);
+    if (data.length < page) break;
+  }
+  return out;
+}
+
+async function loadFollowerCounts(sdk, ids) {
+  const counts = new Map();
+  for (let i = 0; i < ids.length; i += BOOST.countBatch) {
+    const chunk = ids.slice(i, i + BOOST.countBatch);
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      try {
+        const res = await readRetry(() => sdk.users.getBulkUsers({ id: chunk }));
+        for (const u of (res && res.data) || []) {
+          const n = u.followerCount !== undefined ? u.followerCount : u.follower_count;
+          if (Number.isFinite(Number(n))) counts.set(String(u.id), Number(n));
+        }
+        break;
+      } catch (e) {
+        if (!isRateLimit(e) || attempt === 3) break;
+        await sleep(3000 * (attempt + 1));
+      }
+    }
+  }
+  return counts;
+}
+
+async function loadFollowerIds(sdk, targetId, max) {
+  const ids = new Set();
+  for (let offset = 0; offset < max; offset += 100) {
+    const res = await readRetry(() => sdk.users.getFollowers({ id: targetId, limit: 100, offset }));
+    const list = (res && res.data) || [];
+    for (const u of list) ids.add(String(u.id));
+    if (list.length < 100) break;
+  }
+  return ids;
+}
+
+async function boostJob(state, acct, target, precheck) {
+  const st = state.stats;
+  const who = acct.handle ? `@${acct.handle}` : acct.address;
+  const say = text => { if (VERBOSE) log(`[*] ${who} -> @${target.handle} | ${text}`); };
+  let outcome;
+  try {
+    let sdk = state.sdks.get(acct.address);
+    if (!sdk) { sdk = makeSdk(acct); state.sdks.set(acct.address, sdk); }
+
+    if (precheck && await isFollowing(sdk, acct.user_id, target.id)) {
+      say('already following');
+      return 'already';
+    }
+    let verified = false;
+    let lastErr = null;
+    for (const i of state.style === null ? [0, 1] : [state.style]) {
+      lastErr = null;
+      try { await withTimeout(sdk.users.followUser(FOLLOW_STYLES[i](acct.user_id, target.id)), CFG.callTimeoutMs, 'followUser'); } catch (e) {
+        if (isRateLimit(e)) throw e;
+        lastErr = e;
+        if (!statusOf(e) && /required parameter|invalid/i.test(String(e.message))) continue;
+      }
+      if (await verifyFollow(sdk, acct.user_id, target.id)) {
+        if (state.style === null) state.style = i;
+        lastErr = null;
+        verified = true;
+        break;
+      }
+    }
+    if (!verified) throw lastErr || new Error('follow could not be verified');
+    state.consecFail = 0;
+    st.ok++;
+    outcome = 'ok';
+    say('successful');
+  } catch (e) {
+    const kind = classify(e);
+    if (kind === 'rate') { outcome = 'rate'; st.rate++; say('429'); }
+    else if (kind === 'permanent') { outcome = 'perm'; st.perm++; state.cool.add(acct.address); say(reason(e)); }
+    else { outcome = 'retry'; st.retry++; say(reason(e)); }
+    if (++state.consecFail >= CFG.failStopAfter && !state.stop) {
+      state.stop = true;
+      log('[!] Too many failures in a row; ending this batch early.');
+    }
+  }
+  if (CFG.followDelayMs) await sleep(CFG.followDelayMs);
+  return outcome;
+}
+
+async function boostTarget(state, target, attempts, candidates, precheck) {
+  let got = 0;
+  let started = 0;
+  const step = async () => {
+    if (state.stop) return false;
+    if (started >= attempts) return false;
+    const acct = candidates.shift();
+    if (!acct) return false;
+    started++;
+    const outcome = await boostJob(state, acct, target, precheck);
+    if (outcome === 'ok') got++;
+    if (outcome === 'already') started--;
+    return true;
+  };
+  for (let n = 0; n < 3 && state.style === null; n++) if (!(await step())) break;
+  await Promise.all(Array.from({ length: Math.max(1, CFG.concurrency) }, async () => { while (await step()); }));
+  return { got, started };
+}
+
+async function boostBatch(state, sb, batchNo) {
+  const accounts = await fetchBoostAccounts(sb);
+  const withCreds = accounts.filter(hasCreds);
+  if (!withCreds.length) {
+    log('[!] No account with complete credentials.');
+    return;
+  }
+  const reader = shuffle(withCreds)[0];
+  const sdk = makeSdk(reader);
+  const counts = await loadFollowerCounts(sdk, accounts.filter(a => a.user_id).map(a => String(a.user_id)));
+  const tiers = BOOST.maxFollowers > BOOST.targetFollowers ? [BOOST.targetFollowers, BOOST.maxFollowers] : [BOOST.targetFollowers];
+  let goal = 0;
+  let low = [];
+  for (const tier of tiers) {
+    low = accounts.filter(a => a.user_id && counts.has(String(a.user_id)) && counts.get(String(a.user_id)) < tier &&
+      !(Date.now() - (state.exhausted.get(`${a.address}:${tier}`) || 0) < 3600000));
+    if (low.length) { goal = tier; break; }
+  }
+  if (!low.length) {
+    if (!state.idle) log(`[*] No accounts left to boost; checking again every ${Math.round(BOOST.waitMs / 60000)} min.`);
+    state.idle = true;
+    return;
+  }
+  state.idle = false;
+  if (state.goal && state.goal !== goal) log(`[*] Goal is now ${goal} followers per account.`);
+  state.goal = goal;
+  const targets = shuffle(low)
+    .sort((x, y) => (state.targeted.get(x.address) || 0) - (state.targeted.get(y.address) || 0))
+    .slice(0, BOOST.batchSize);
+  log(`[*] Batch ${batchNo}: ${targets.length} of ${low.length} accounts under ${goal} followers.`);
+
+  state.stats = { ok: 0, rate: 0, retry: 0, perm: 0 };
+  state.stop = false;
+  state.consecFail = 0;
+  let total = 0;
+  for (const acct of targets) {
+    if (state.stop) break;
+    const id = String(acct.user_id);
+    const have = counts.get(id);
+    const need = goal - have;
+    let existing = null;
+    try { existing = await loadFollowerIds(sdk, id, 200); } catch (_) { existing = null; }
+    const pool = withCreds.filter(a => String(a.user_id) !== id && !state.cool.has(a.address) && !(existing && existing.has(String(a.user_id))));
+    const target = { id, handle: acct.handle || acct.address };
+    if (!pool.length) {
+      state.exhausted.set(`${acct.address}:${goal}`, Date.now());
+      log(`[*] @${target.handle} | no accounts left to follow it (had ${have})`);
+      continue;
+    }
+    const { got } = await boostTarget(state, target, need, shuffle(pool), !existing);
+    state.targeted.set(acct.address, (state.targeted.get(acct.address) || 0) + 1);
+    total += got;
+    log(`[*] @${target.handle} | ${got}/${need} followed (had ${have})`);
+  }
+  const st = state.stats;
+  const parts = [`${total} followed`];
+  if (st.rate) parts.push(`${st.rate} rate-limited`);
+  if (st.retry) parts.push(`${st.retry} errors`);
+  if (st.perm) parts.push(`${st.perm} failed`);
+  log(`[*] Batch ${batchNo} complete: ${parts.join(', ')}.`);
+}
+
+async function runBoost() {
+  const sb = connectSupabase();
+  const state = { style: null, sdks: new Map(), cool: new Set(), targeted: new Map(), stats: { ok: 0, rate: 0, retry: 0, perm: 0 }, stop: false, consecFail: 0, idle: false, goal: 0, exhausted: new Map() };
+  for (let batchNo = 1; ; batchNo++) {
+    try {
+      await boostBatch(state, sb, batchNo);
+    } catch (e) {
+      log(`[!] Batch ${batchNo} failed: ${errMsg(e).slice(0, 80)}`);
+    }
+    await sleep(BOOST.waitMs);
+  }
+}
+
+const MODE_ARG = process.argv.slice(2).find(a => /^id=/.test(a));
+
 if (require.main === module) {
-  runFollower().catch(err => {
+  let task;
+  if (!MODE_ARG) task = runFollower();
+  else if (MODE_ARG === 'id=2') task = runBoost();
+  else {
+    console.error(`[!] Unknown mode "${MODE_ARG}". Use no argument, or id=2.`);
+    process.exit(1);
+  }
+  task.catch(err => {
     console.error('[!] Fatal error:', err.message || err);
     process.exit(1);
   });
 }
 
-module.exports = { runFollower, latestHandles, buildContext, CFG };
+module.exports = { runFollower, runBoost, latestHandles, buildContext, CFG };
