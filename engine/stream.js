@@ -7,7 +7,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const { createClient } = require('@supabase/supabase-js');
+
+const asyncLocalStorage = new AsyncLocalStorage();
 
 const DEFAULT_PROXIES = [
   'https://audius-v2.qringgreen.workers.dev',
@@ -31,6 +34,7 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
   const ATTEMPTS = Number(process.env.PROXY_ATTEMPTS || 6);
   const STATUS_ATTEMPTS = Number(process.env.PROXY_STATUS_ATTEMPTS || 3);
   const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+  
   const pick = avoid => {
     const now = Date.now();
     const up = PROXY_URLS.filter(u => (downUntil.get(u) || 0) <= now);
@@ -38,20 +42,28 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     if (avoid && pool.length > 1) pool = pool.filter(u => u !== avoid);
     return pool[Math.floor(Math.random() * pool.length)];
   };
+
   console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
   globalThis.fetch = async (input, init) => {
     const isReq = typeof input === 'object' && input !== null && 'url' in input;
     let url;
     try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
     if (url.hostname !== 'api.audius.co') return realFetch(input, init);
+    
     const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
     if (PROXY_KEY) headers.set('x-proxy-key', PROXY_KEY);
     let lastErr;
     let lastProxy = null;
     let statusTries = 0;
+    
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-      const proxy = pick(lastProxy);
+      // Check if the current worker has an assigned proxy that is still healthy
+      const assigned = asyncLocalStorage.getStore()?.proxy;
+      const isAssignedHealthy = assigned && (downUntil.get(assigned) || 0) <= Date.now();
+      
+      const proxy = (isAssignedHealthy && assigned !== lastProxy) ? assigned : pick(lastProxy);
       lastProxy = proxy;
+      
       const target = proxy + url.pathname + url.search;
       let res;
       try {
@@ -135,6 +147,7 @@ const CFG = {
   assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
+  workerCount: 10, // 10 dedicated workers
 };
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -554,10 +567,10 @@ async function playStream(streamUrl, playMs, durationSec) {
   }
 }
 
-async function streamJob(sb, ctx, run, acct, target) {
+async function streamJob(sb, ctx, run, acct, target, workerId) {
   const st = run.stats;
   const who = acct.handle ? `@${acct.handle}` : acct.address;
-  const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id} | ${text}`); };
+  const say = text => { if (VERBOSE) log(`[${workerId}] ${who} -> track ${target.id} | ${text}`); };
   let result = null;
   let outcome;
   let stage = 'trackInfo';
@@ -569,11 +582,8 @@ async function streamJob(sb, ctx, run, acct, target) {
     result = await withRetry(async () => {
       stage = 'trackInfo';
       const meta = await getTrackMeta(run, target, sdk);
-      
-      // FIXED: Strictly use the configured STREAM_DURATION_MS
       let playMs = CFG.streamDurationMs;
       stage = 'play';
-      
       return playStream(meta.streamUrl, playMs, meta.duration);
     }, e => {
       if (e && e.interrupted) return false; 
@@ -611,7 +621,7 @@ async function streamJob(sb, ctx, run, acct, target) {
     }
     acct.today++;
     const detail = `${(result.playbackMs / 1000).toFixed(1)}s played in ${(result.wallMs / 1000).toFixed(1)}s, ${Math.round(result.bytes / 1024)} KB${result.ended ? ', stream ended' : ''}, HTTP ${result.status} ${result.contentType}, user ${acct.user_id}`;
-    if (!saved) log(`[!] ${who} -> track ${target.id} | completed (${detail}), DB save failed (kept locally)`);
+    if (!saved) log(`[!] ${workerId} ${who} -> track ${target.id} | completed (${detail}), DB save failed (kept locally)`);
     else say(`completed: ${detail}`);
   }
 
@@ -622,23 +632,46 @@ async function streamJob(sb, ctx, run, acct, target) {
 async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let got = 0;
   let started = 0;
-  
-  while (got < maxOk && started < attempts) {
-    if (run.abort || LOCK_LOST || run.stop) break;
-    if (CFG.maxRunMs && Date.now() - run.startedAt > CFG.maxRunMs) {
-      run.stop = true;
-      log('[!] Time limit reached; stopping. Next run resumes.');
-      break;
-    }
+  let stopWorkers = false;
+
+  const worker = async (id) => {
+    // Split the proxies across the workers: Worker 1 -> Proxy 0, Worker 7 -> Proxy 0, etc.
+    const proxy = PROXY_URLS[(id - 1) % PROXY_URLS.length];
     
-    let acct = candidates.shift();
-    while (acct && run.cool.has(acct.address)) acct = candidates.shift();
-    if (!acct) break;
-    
-    started++;
-    const outcome = await streamJob(sb, ctx, run, acct, target);
-    if (outcome === 'ok') got++;
+    return asyncLocalStorage.run({ proxy }, async () => {
+      log(`[worker${id}] Streaming ${target.id} | target ${maxOk}`);
+      
+      while (!stopWorkers) {
+        if (run.abort || LOCK_LOST || run.stop) break;
+        if (CFG.maxRunMs && Date.now() - run.startedAt > CFG.maxRunMs) {
+          run.stop = true;
+          log(`[!] Time limit reached; stopping. Next run resumes.`);
+          break;
+        }
+        if (got >= maxOk || started >= attempts) {
+           stopWorkers = true;
+           break;
+        }
+        
+        let acct = candidates.shift();
+        while (acct && run.cool.has(acct.address)) acct = candidates.shift();
+        if (!acct) {
+           stopWorkers = true;
+           break;
+        }
+        
+        started++;
+        const outcome = await streamJob(sb, ctx, run, acct, target, `worker${id}`);
+        if (outcome === 'ok') got++;
+      }
+    });
+  };
+
+  const promises = [];
+  for (let i = 1; i <= CFG.workerCount; i++) {
+    promises.push(worker(i));
   }
+  await Promise.all(promises);
   
   return { got, started, skipped: started - got };
 }
@@ -738,11 +771,8 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const order = shuffle(pool).sort((x, y) => x.today - y.today);
     const candidates = order.length ? Array.from({ length: n.attempts }, (_, i) => order[i % order.length]) : [];
     
-    log(`[*] Streaming ${t.id} | target ${(todayDone.get(t.key) || 0) + Math.min(n.attempts, n.maxOk)}`);
     VERBOSE = true;
-    
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
-    
     VERBOSE = false;
     
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
