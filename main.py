@@ -20,10 +20,10 @@ sys.path.insert(0, str(ROOT_DIR))
 STREAM_ENABLED = True  
 
 # Set to False to completely mute stream.js logs (it will still run silently)
-STREAM_SHOW_LOGS = False
+STREAM_SHOW_LOGS = True
 
 # Set to False to completely mute the main pipeline logs (upload, follower, etc.)
-PIPELINE_SHOW_LOGS = True
+PIPELINE_SHOW_LOGS = False
 
 PIPELINE = [
     ("upload_track.js", True),
