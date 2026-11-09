@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// FIXED: Restored to 65s. Audius requires >= 60s of playback to register a play.
-const STREAM_DURATION_MS = 65000;
+const STREAM_DURATION_MS = 60000;
 
 const fs = require('fs');
 const os = require('os');
@@ -30,10 +29,7 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     const isReq = typeof input === 'object' && input !== null && 'url' in input;
     let url;
     try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
-    
-    // FIXED: Catch all Audius domains (api.audius.co, creator nodes, etc.) so streaming is proxied
-    if (!url.hostname.includes('audius')) return realFetch(input, init);
-    
+    if (url.hostname !== 'api.audius.co') return realFetch(input, init);
     const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
     if (PROXY_KEY) headers.set('x-proxy-key', PROXY_KEY);
     let lastErr;
@@ -114,7 +110,6 @@ const CFG = {
   assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
-  // RESTORED: Concurrency back to 5
   concurrency: Number(process.env.CONCURRENCY || 5),
 };
 
