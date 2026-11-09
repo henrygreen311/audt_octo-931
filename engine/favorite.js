@@ -94,7 +94,6 @@ const TARGET_ADDRESS = 'qringgreen@gmail.com';
 const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
   dailyPerTrack: Number(process.env.DAILY_FAVORITES_PER_TRACK || 100),
-  dailyPerPreviousTrack: Number(process.env.DAILY_FAVORITES_PER_PREVIOUS_TRACK || 10),
   runsPerDay: 2,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
@@ -224,22 +223,26 @@ async function readUpTracks(sb) {
   return data && data[0] ? data[0].up_tracks : null;
 }
 
-function collectTracks(upTracks, today) {
+// Only the LAST published batch counts: the newest date in up_tracks that has at least one
+// successful upload. Earlier days are ignored completely, and the same tracks stay the
+// targets until upload_track.js publishes a newer batch.
+function collectTracks(upTracks) {
   const days = isObj(upTracks) && Array.isArray(upTracks.days) ? upTracks.days : [];
+  const ok = days.filter(d => d && d.status === 'success' && d.track_id != null && typeof d.date === 'string' &&
+    TRACK_ID_RE.test(String(d.track_id).trim()));
+  if (!ok.length) return [];
+  const latest = ok.reduce((m, d) => (d.date > m ? d.date : m), ok[0].date);
   const seen = new Map();
-  for (const d of days) {
-    if (!d || d.status !== 'success' || d.track_id == null || typeof d.date !== 'string' || d.date > today) continue;
+  for (const d of ok) {
+    if (d.date !== latest) continue;
     const id = String(d.track_id).trim();
-    if (!TRACK_ID_RE.test(id)) continue;
-    const isToday = d.date === today;
-    const prev = seen.get(id);
-    if (prev && !(isToday && prev.previous)) continue;
+    if (seen.has(id)) continue;
     seen.set(id, {
       id, key: id, address: d.address || null, handle: typeof d.handle === 'string' ? d.handle : null,
-      date: d.date, previous: !isToday, cap: isToday ? CFG.dailyPerTrack : CFG.dailyPerPreviousTrack,
+      date: latest, cap: CFG.dailyPerTrack,
     });
   }
-  return [...seen.values()].sort((x, y) => (x.previous - y.previous) || (x.date < y.date ? 1 : x.date > y.date ? -1 : 0));
+  return [...seen.values()];
 }
 
 function normalizeFavorite(raw, weekStart) {
@@ -580,13 +583,11 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   }));
   let totalNeed = 0;
   let active = 0;
-  let activePrev = 0;
   for (const t of targets) {
     const n = need.get(t.key);
     if (!n.attempts) continue;
     totalNeed += Math.min(n.attempts, n.maxOk);
     active++;
-    if (t.previous) activePrev++;
   }
   if (!totalNeed) {
     if (!tracksBelowCap(rows, targets, ctx).length) {
@@ -604,7 +605,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     return { status: 'COMPLETED' };
   }
   const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
-  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do (${active - activePrev} today, ${activePrev} previous days)${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} favorites.`);
+  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} favorites.`);
 
   if (!batch) {
     await updateFavorite(sb, TARGET_ADDRESS, ctx.weekStart, h => {
@@ -628,11 +629,10 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     const day = (todayDone.get(t.key) || 0) + got;
-    const tag = t.previous ? ' [previous day]' : '';
     if (started < n.attempts && got < n.maxOk && !run.stop) {
-      log(`[!] track ${t.id}${tag} | ${day}/${t.cap} today (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
+      log(`[!] track ${t.id} | ${day}/${t.cap} today (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
     } else {
-      log(`[*] track ${t.id}${tag} | ${day}/${t.cap} today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
+      log(`[*] track ${t.id} | ${day}/${t.cap} today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
     }
     if (run.stop) incomplete = true;
   }
@@ -660,12 +660,12 @@ async function runFavorite({ now = new Date() } = {}) {
   const sb = connectSupabase();
   PENDING = loadPending();
 
-  const published = collectTracks(await readUpTracks(sb), ctx.today);
+  const published = collectTracks(await readUpTracks(sb));
   if (!published.length) {
-    log('[!] No successful tracks found. Exiting.');
+    log('[!] No successfully published tracks found in up_tracks. Exiting.');
     return { status: 'NO_TARGETS' };
   }
-  if (!published.some(t => !t.previous)) log('[*] No tracks published today; using previous days only.');
+  log(`[*] Targeting the last published batch (${published[0].date}): ${published.length} track(s).`);
 
   let rows = await fetchRows(sb);
   const coordRaw = rows.find(r => r.address === TARGET_ADDRESS).favorite;

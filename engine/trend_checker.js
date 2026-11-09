@@ -20,14 +20,17 @@ const CFG = {
   pageSize: Number(process.env.TREND_PAGE_SIZE || 100),
   minPageSize: 25,
   topDepth: 100,
-  bonusDepth: Number(process.env.TREND_BONUS_DEPTH || 1000),
+  bonusDepth: Math.min(300, Number(process.env.TREND_BONUS_DEPTH || 300)),
   rateRetries: 3,
   rateWaitMs: Number(process.env.RATE_WAIT_MS || 3000),
 };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const statusOf = e => e && ((e.response && e.response.status) || e.status);
-const errMsg = e => `${statusOf(e) ? `HTTP ${statusOf(e)} ` : ''}${(e && e.message) || e}`;
+const errMsg = e => {
+  const m = String((e && e.message) || e);
+  return statusOf(e) && !/^HTTP \d+/.test(m) ? `HTTP ${statusOf(e)} ${m}` : m;
+};
 
 function isRateLimit(e) {
   return statusOf(e) === 429 || /rate.?limit|too many requests|\b429\b/i.test(String((e && e.message) || e));
@@ -143,17 +146,17 @@ function indexAccounts(accounts) {
 function describe(hit) {
   const t = hit.track;
   const handle = (t.user && t.user.handle) || hit.acct.handle || hit.acct.address;
-  const link = t.permalink ? ` | https://audius.co${t.permalink}` : '';
-  return `#${hit.rank} @${String(handle).replace(/^@/, '')} | "${t.title || 'untitled'}" | ${t.id}${link}`;
+  const link = VERBOSE && t.permalink ? ` | https://audius.co${t.permalink}` : '';
+  return `#${hit.rank} @${String(handle).replace(/^@/, '')} | ${t.title || 'untitled'} | ${t.id}${link}`;
 }
 
 function report(label, hits, from, to) {
   const part = hits.filter(h => h.rank >= from && h.rank <= to);
   if (!part.length) {
-    log(`[*] ${label}: none of our accounts.`);
+    log(`[*] ${label}: none`);
     return 0;
   }
-  log(`[*] ${label}: ${part.length} of our tracks found.`);
+  log(`[*] ${label}: ${part.length} found`);
   for (const h of part) log(`[*]   ${describe(h)}`);
   return part.length;
 }
@@ -163,10 +166,10 @@ async function runTrendCheck() {
   const accounts = await fetchAccounts(sb);
   const owner = indexAccounts(accounts);
   log('[*] Route: direct');
-  log(`[*] Checking ${accounts.length} accounts against trending lists.`);
 
   let topTotal = 0;
   let bonusTotal = 0;
+  const bonusLabel = `#${CFG.topDepth + 1}-${CFG.bonusDepth}`;
   for (const board of BOARDS) {
     const items = await loadBoard(board, CFG.bonusDepth);
     const hits = [];
@@ -176,10 +179,10 @@ async function runTrendCheck() {
     });
     topTotal += report(`${board.name} Top ${CFG.topDepth}`, hits, 1, CFG.topDepth);
     if (CFG.bonusDepth > CFG.topDepth) {
-      bonusTotal += report(`${board.name} Top ${CFG.bonusDepth} (bonus, #${CFG.topDepth + 1}-${CFG.bonusDepth})`, hits, CFG.topDepth + 1, CFG.bonusDepth);
+      bonusTotal += report(`${board.name} ${bonusLabel}`, hits, CFG.topDepth + 1, CFG.bonusDepth);
     }
   }
-  log(`[*] Trend check complete: ${topTotal} in Top ${CFG.topDepth}, ${bonusTotal} in bonus range.`);
+  log(`[*] Trend check complete: ${topTotal} in Top ${CFG.topDepth}, ${bonusTotal} in ${bonusLabel}.`);
   return { top: topTotal, bonus: bonusTotal };
 }
 

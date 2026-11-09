@@ -52,10 +52,15 @@ const TARGET_ADDRESS = 'qringgreen@gmail.com';
 
 const CFG = {
   timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
-  accountsPerDay: 10,
-  tracksPerDay: 3,
+  accountsPerDay: 10,            // accounts published per batch (one track each)
+  tracksPerDay: 10,              // tracks generated per batch: one unique track per account
+  trackBatchSize: 3,             // generated as 3 + 3 + 3 + 1; each batch is downloaded before the next starts
+  maxPriorityPerBatch: 7,        // up to 7 priority accounts per batch; the remaining slots are random
+  // Publishing days in the Saturday-based week (0=Sat 1=Sun 2=Mon 3=Tue 4=Wed 5=Thu 6=Fri):
+  // Saturday (reset day, 1st batch) and Tuesday (3 days later, 2nd batch) = twice a week.
+  publishDayIndexes: [0, 3],
+  forceRun: process.env.FORCE_RUN === '1', // run even on a non-publishing day
   priorityHandles: ['qring', 'obi350965', '7ebe3e67', '904c4687', '4c9ebc6a', 'd71a941b', 'a8cde724', 'b41ba8a6', 'e8b592ac'],
-  priorityPerWeek: 3,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   // A lock of unknown ownership with no data recorded for today is treated as stale after this long (0 = off).
   lockIdleMs: Number(process.env.LOCK_IDLE_MINUTES ?? 10) * 60000,
@@ -172,48 +177,6 @@ function uniqueDescription(title, extras, used) {
 }
 
 // ---------------------------------------------------------------------------
-// Title generator for the 17 non-original accounts. The vocabulary matches the
-// genre/mood published by createTrack (Electronic / Energizing), and half of
-// the titles borrow a word from the track's own generated title so they stay
-// thematically tied to the actual audio.
-// ---------------------------------------------------------------------------
-const TITLE = {
-  adj: ["Midnight", "Neon", "Velvet", "Electric", "Hollow", "Golden", "Silent", "Crimson", "Fading", "Distant", "Burning",
-    "Frozen", "Static", "Lunar", "Chrome", "Wandering", "Restless", "Glass", "Endless", "Silver", "Wild", "Slow", "Radiant",
-    "Broken", "Violet", "Phantom", "Cosmic", "Liquid", "Amber", "Northern", "Digital", "Hidden", "Paper", "Shadow", "Solar"],
-  noun: ["Skyline", "Echoes", "Horizon", "Signal", "Afterglow", "Pulse", "Circuit", "Mirage", "Gravity", "Voltage", "Embers",
-    "Tides", "Orbit", "Daydream", "Highway", "Satellite", "Reflections", "Currents", "Silhouette", "Rhythm", "Lights",
-    "Memories", "Fever", "Atlas", "Drift", "Runway", "Canyon", "Sunrise", "Thunder", "Compass", "Frequency", "Skyway"],
-  tail: ["After Dark", "Tonight", "at Midnight", "in Slow Motion", "Till Sunrise", "in the Rain", "Come Alive", "Never Sleeps",
-    "Calling", "on Repeat", "Forever", "Rising"],
-};
-
-function generateTitle(originalTitle, usedLower) {
-  const keys = originalTitle.split(/\s+/).filter(w => w.replace(/[^a-z]/gi, '').length >= 4);
-  const key = keys.length ? cap(pick(keys).toLowerCase()) : null;
-  const makers = [
-    () => `${pick(TITLE.adj)} ${pick(TITLE.noun)}`,
-    () => `${pick(TITLE.noun)} ${pick(TITLE.tail)}`,
-    () => `${pick(TITLE.noun)} of ${pick(TITLE.adj)} ${pick(TITLE.noun)}`,
-    () => `${pick(TITLE.adj)} ${pick(TITLE.noun)} ${pick(TITLE.tail)}`,
-  ];
-  if (key) makers.push(() => `${key} ${pick(TITLE.noun)}`, () => `${pick(TITLE.adj)} ${key}`, () => `${key} ${pick(TITLE.tail)}`);
-
-  let title;
-  for (let i = 0; i < 80; i++) {
-    title = pick(makers)();
-    if (!usedLower.has(title.toLowerCase())) break;
-    title = null;
-  }
-  if (!title) {
-    do { title = `${pick(TITLE.adj)} ${pick(TITLE.noun)} ${Math.floor(Math.random() * 90) + 10}`; }
-    while (usedLower.has(title.toLowerCase()));
-  }
-  usedLower.add(title.toLowerCase());
-  return title;
-}
-
-// ---------------------------------------------------------------------------
 // Generic helpers
 // ---------------------------------------------------------------------------
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -300,7 +263,10 @@ function buildContext(now) {
   for (const x of parts) p[x.type] = x.value;
   const today = `${p.year}-${p.month}-${p.day}`;
   const dayIndex = ['Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'].indexOf(p.weekday);
-  return { today, dayName: p.weekday, dayIndex, weekStart: addDays(today, -dayIndex), tz: CFG.timezone };
+  return {
+    today, dayName: p.weekday, dayIndex, weekStart: addDays(today, -dayIndex), tz: CFG.timezone,
+    isPublishDay: CFG.publishDayIndexes.includes(dayIndex),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -581,61 +547,33 @@ async function resolvePriorityAccounts(accounts) {
   }
 }
 
-// Priority accounts: 3 days per Saturday-based week, no two adjacent when possible.
-// The plan is derived from (week, handle) so it never needs to be stored, and
-// missed days are caught up automatically.
-function priorityPlan(weekStart, handle) {
-  const combos = [];
-  for (let a = 0; a < 7; a++) for (let b = a + 2; b < 7; b++) for (let c = b + 2; c < 7; c++) combos.push([a, b, c]);
-  const rnd = mulberry32(hashSeed(`${weekStart}|${handle.toLowerCase()}`));
-  return combos[Math.floor(rnd() * combos.length)];
-}
-
-function isPriorityDue(acct, ctx) {
-  if (acct.successCount >= CFG.priorityPerWeek) return false;
-  const plan = priorityPlan(ctx.weekStart, acct.handle);
-  const plannedRemaining = plan.filter(d => d >= ctx.dayIndex).length;
-  return plan.includes(ctx.dayIndex) || acct.successCount + plannedRemaining < CFG.priorityPerWeek;
-}
-
-function chooseAccounts(accounts, ctx, need, blocked) {
-  const due = accounts.filter(a => a.isPriority && !a.todayEntry && !blocked.has(a.address) && isPriorityDue(a, ctx));
-  due.filter(a => !a.hasCreds).forEach(a => log(`[!] Priority account @${a.handle} is due today but has incomplete credentials.`));
-  const picked = due.filter(a => a.hasCreds).slice(0, need);
+// Each batch: up to CFG.maxPriorityPerBatch priority accounts, the rest random.
+// Priority accounts with the fewest uploads this week go first (ties are random), so the
+// 9 priority accounts rotate fairly across the two weekly batches. If fewer priority
+// accounts are available, the shortfall is filled from the random pool.
+function chooseAccounts(accounts, ctx, need, blocked, todayAccounts = []) {
+  const priorityRoom = Math.max(0, CFG.maxPriorityPerBatch - todayAccounts.filter(a => a.isPriority).length);
+  const eligible = accounts.filter(a => a.isPriority && !a.todayEntry && !blocked.has(a.address));
+  eligible.filter(a => !a.hasCreds).forEach(a => log(`[!] Priority account @${a.handle} has incomplete credentials; skipping it.`));
+  const picked = shuffle(eligible.filter(a => a.hasCreds))
+    .sort((a, b) => a.successCount - b.successCount)
+    .slice(0, Math.min(need, priorityRoom));
   const slots = need - picked.length;
   const pool = accounts.filter(a => !a.isPriority && a.hasCreds && !a.todayEntry && a.successCount === 0 && !blocked.has(a.address));
   if (pool.length < slots) {
-    throw new Error(`Not enough eligible accounts: need ${slots} more but only ${pool.length} have not published this week.`);
+    throw new Error(`Not enough eligible accounts: need ${slots} more random account(s) but only ${pool.length} have not published this week.`);
   }
   return shuffle([...picked, ...shuffle(pool).slice(0, slots)]);
 }
 
-// Balanced random assignment: the first account of each track keeps the original
-// title; everyone else gets a fresh title. Always fills the track with the fewest accounts.
+// One unique track per account, always with the track's original title.
 function assignNewAccounts(newAccounts, todayAccounts, tracks) {
-  const slots = tracks.map(t => t.slot);
-  const counts = Object.fromEntries(slots.map(s => [s, 0]));
-  const holders = new Set();
-  const usedTitles = new Set(tracks.map(t => t.title.toLowerCase()));
-  for (const a of todayAccounts) {
-    const e = a.todayEntry;
-    if (counts[e.generated_track] !== undefined) counts[e.generated_track]++;
-    usedTitles.add(String(e.published_title).toLowerCase());
-    if (e.published_title === e.original_title) holders.add(e.generated_track);
+  const taken = new Set(todayAccounts.map(a => a.todayEntry.generated_track));
+  const free = shuffle(tracks.filter(t => !taken.has(t.slot)));
+  if (free.length < newAccounts.length) {
+    throw new Error(`Only ${free.length} unassigned track(s) for ${newAccounts.length} account(s).`);
   }
-  return newAccounts.map(acct => {
-    const open = slots.filter(s => !holders.has(s));
-    let slot, original;
-    if (open.length) { slot = pick(open); original = true; holders.add(slot); }
-    else {
-      const min = Math.min(...slots.map(s => counts[s]));
-      slot = pick(slots.filter(s => counts[s] === min));
-      original = false;
-    }
-    counts[slot]++;
-    const track = tracks.find(t => t.slot === slot);
-    return { acct, slot, track, title: original ? track.title : generateTitle(track.title, usedTitles) };
-  });
+  return newAccounts.map((acct, i) => ({ acct, slot: free[i].slot, track: free[i], title: free[i].title }));
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +595,7 @@ function saveJournal(j) {
 }
 
 // ---------------------------------------------------------------------------
-// Music generation (music/create_track.py, MAX_TRACKS=3)
+// Music generation (music/create_track.py in batches of 3, 3, 3 and 1)
 // ---------------------------------------------------------------------------
 function snapshotDir(dir, ext) {
   const m = new Map();
@@ -697,46 +635,83 @@ function titleFromFilename(audioFilename) {
   return rawTitle.replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function generateTracks() {
-  const target = CFG.tracksPerDay;
-  const snapA = snapshotDir(MUSIC_DIR, '.mp3');
-  const snapJ = snapshotDir(IMAGES_DIR, '.jpg');
-  let pairs = [];
-
-  for (let attempt = 0; attempt <= CFG.genTopUpAttempts && pairs.length < target; attempt++) {
-    const count = attempt === 0 ? target : target - pairs.length; // top-ups only request what is missing
-    log(`[*] Triggering music generation (MAX_TRACKS=${count})...`);
-    try {
-      execSync('python3 music/create_track.py', {
-        cwd: ROOT_DIR, stdio: 'inherit', timeout: CFG.genTimeoutMs,
-        env: { ...process.env, MAX_TRACKS: String(count) },
-      });
-    } catch (e) {
-      console.error(`[!] Python script failed: ${e.message}`);
-    }
-    pairs = pairFiles(newFiles(MUSIC_DIR, '.mp3', snapA), newFiles(IMAGES_DIR, '.jpg', snapJ));
-    log(`[*] ${pairs.length}/${target} track(s) (audio + cover) ready.`);
-  }
-
-  if (pairs.length < target) throw new Error(`Only ${pairs.length}/${target} tracks were generated`);
-  if (pairs.length > target) {
-    log(`[~] ${pairs.length} tracks found; using the newest ${target}.`);
-    pairs = pairs.slice(-target);
-  }
-  return pairs.map((p, i) => ({
-    slot: `track_${i + 1}`, title: titleFromFilename(p.mp3.name), audioPath: p.mp3.path, coverPath: p.jpg.path,
-  }));
+function batchSizes(n) {
+  const sizes = [];
+  for (let left = n; left > 0; left -= CFG.trackBatchSize) sizes.push(Math.min(CFG.trackBatchSize, left));
+  return sizes;
 }
 
-function ensureTracks(ctx, journal) {
-  const ok = journal.date === ctx.today && journal.tracks.length === CFG.tracksPerDay &&
-    journal.tracks.every(t => fs.existsSync(t.audioPath) && fs.existsSync(t.coverPath));
-  if (ok) {
-    log('[*] Reusing the 3 tracks already generated for today.');
-    return journal.tracks;
+function nextSlot(tracks) {
+  const used = new Set(tracks.map(t => t.slot));
+  let i = 1;
+  while (used.has(`track_${i}`)) i++;
+  return `track_${i}`;
+}
+
+// One create_track.py run. It queues `count` songs, then calls tracks_dl.download_tracks()
+// itself and blocks until they are downloaded (audio + cover) and removed from AceMusic,
+// so the next batch always starts from a clean slate.
+function runGenerationBatch(count, label) {
+  const snapA = snapshotDir(MUSIC_DIR, '.mp3');
+  const snapJ = snapshotDir(IMAGES_DIR, '.jpg');
+  log(`[*] ${label}: generating ${count} track(s); tracks_dl.py will download them (MAX_TRACKS=${count})...`);
+  try {
+    execSync('python3 music/create_track.py', {
+      cwd: ROOT_DIR, stdio: 'inherit', timeout: CFG.genTimeoutMs,
+      env: { ...process.env, MAX_TRACKS: String(count) },
+    });
+  } catch (e) {
+    console.error(`[!] Python script failed: ${e.message}`);
   }
-  const tracks = generateTracks();
+  return pairFiles(newFiles(MUSIC_DIR, '.mp3', snapA), newFiles(IMAGES_DIR, '.jpg', snapJ));
+}
+
+// Generates (or finishes generating) the day's tracks batch by batch: 3, then 3, then 3,
+// then the final 1 = 10. `afterBatch(tracks)` runs after every batch (journal + lock renewal).
+async function generateTracks(existing, afterBatch) {
+  const total = CFG.tracksPerDay;
+  const tracks = [...existing];
+  const seen = new Set(tracks.map(t => t.audioPath));
+  const sizes = batchSizes(total - tracks.length);
+
+  for (let b = 0; b < sizes.length; b++) {
+    let need = sizes[b];
+    for (let attempt = 0; attempt <= CFG.genTopUpAttempts && need > 0; attempt++) {
+      const label = `Batch ${b + 1}/${sizes.length}${attempt ? ` (top-up ${attempt})` : ''}`;
+      const fresh = runGenerationBatch(need, label).filter(p => !seen.has(p.mp3.path)).slice(-need);
+      for (const p of fresh) {
+        seen.add(p.mp3.path);
+        tracks.push({ slot: nextSlot(tracks), title: titleFromFilename(p.mp3.name), audioPath: p.mp3.path, coverPath: p.jpg.path });
+      }
+      need -= fresh.length;
+      log(`[*] ${label}: ${fresh.length} new track(s) downloaded; ${tracks.length}/${total} total.`);
+    }
+    await afterBatch(tracks);
+    if (need > 0) break; // still short after the top-up: stop; a re-run resumes from here
+  }
+
+  if (tracks.length < total) throw new Error(`Only ${tracks.length}/${total} tracks were generated`);
+  return tracks.slice(0, total);
+}
+
+async function ensureTracks(ctx, journal, afterBatch) {
+  const total = CFG.tracksPerDay;
+  const existing = journal.date === ctx.today
+    ? journal.tracks.filter(t => fs.existsSync(t.audioPath) && fs.existsSync(t.coverPath))
+    : [];
+  if (existing.length >= total) {
+    log(`[*] Reusing the ${total} tracks already generated for today.`);
+    return existing.slice(0, total);
+  }
+  if (existing.length) log(`[*] Resuming generation: ${existing.length}/${total} tracks already downloaded.`);
   journal.date = ctx.today;
+  journal.tracks = existing;
+  saveJournal(journal);
+  const tracks = await generateTracks(existing, async list => {
+    journal.tracks = list;
+    saveJournal(journal);
+    await afterBatch();
+  });
   journal.tracks = tracks;
   saveJournal(journal);
   return tracks;
@@ -933,7 +908,7 @@ function printSummary(ctx, accounts, tracksCount, status, failures) {
   const ok = today.filter(a => a.todayEntry.status === 'success');
   const bad = today.filter(a => a.todayEntry.status !== 'success');
   log('\n==============================');
-  log('AUDIUS DAILY PUBLISHING SUMMARY');
+  log('AUDIUS PUBLISHING SUMMARY');
   log('==============================');
   log(`Date: ${ctx.today} (${ctx.dayName}, ${ctx.tz})`);
   log(`Week start (Saturday): ${ctx.weekStart}\n`);
@@ -945,7 +920,7 @@ function printSummary(ctx, accounts, tracksCount, status, failures) {
   log('Priority accounts:');
   for (const h of CFG.priorityHandles) {
     const a = accounts.find(x => x.handle && x.handle.toLowerCase() === h);
-    log(`${h}: ${a ? `${a.successCount}/${CFG.priorityPerWeek} this week` : 'account not found'}`);
+    log(`${h}: ${a ? `${a.successCount} upload(s) this week` : 'account not found'}`);
   }
   if (bad.length) {
     log('\nFailed accounts:');
@@ -953,7 +928,7 @@ function printSummary(ctx, accounts, tracksCount, status, failures) {
       log(`- ${a.handle || a.address}: ${(failures.get(a.address)) || a.todayEntry.error || a.todayEntry.status}`);
     }
   }
-  log(`\nDaily batch status: ${status}\n`);
+  log(`\nBatch status: ${status}\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -963,6 +938,10 @@ async function runDaily({ now = new Date() } = {}) {
   const ctx = buildContext(now);
   const sb = connectSupabase();
   log(`[*] Publishing date ${ctx.today} (${ctx.dayName}, ${ctx.tz}); week starts Saturday ${ctx.weekStart}.`);
+  if (!ctx.isPublishDay && !CFG.forceRun) {
+    log(`[!] ${ctx.dayName} is not a publishing day (batches run every 3 days, twice a week: Saturday and Tuesday). Exiting. Set FORCE_RUN=1 to override.`);
+    return { status: 'NOT_SCHEDULED' };
+  }
 
   // 1. Duplicate-run check against the database BEFORE generating or selecting anything.
   let rows = await fetchAllRows(sb);
@@ -1004,7 +983,7 @@ async function runDaily({ now = new Date() } = {}) {
     const needMore = CFG.accountsPerDay - todayAccounts.length;
     let selected = [];
     try {
-      selected = needMore > 0 ? chooseAccounts(accounts, ctx, needMore, blocked) : [];
+      selected = needMore > 0 ? chooseAccounts(accounts, ctx, needMore, blocked, todayAccounts) : [];
     } catch (e) {
       console.error(`[!] ${e.message}`);
       return { status: 'ABORTED' };
@@ -1017,30 +996,33 @@ async function runDaily({ now = new Date() } = {}) {
       return { status: 'INCOMPLETE' };
     }
 
-    // 5. Generate exactly 3 tracks (or reuse today's) before touching Audius.
+    // 5. Generate the 10 tracks (batches of 3, 3, 3, then 1; each downloaded via tracks_dl.py
+    //    before the next starts) or reuse today's, before touching Audius.
     let tracks;
     try {
-      tracks = ensureTracks(ctx, journal);
+      tracks = await ensureTracks(ctx, journal, () => renewLock(sb, lock));
     } catch (e) {
+      if (e instanceof LockLostError) throw e;
       console.error(`[!] Music generation failed: ${e.message}. Nothing was published; exiting safely.`);
       return { status: 'GENERATION_FAILED' };
     }
     log('\n[+] Generated tracks:');
     tracks.forEach(t => log(`    ${t.slot}: "${t.title}"  (${path.basename(t.audioPath)} + ${path.basename(t.coverPath)})`));
 
-    // 6. Re-point pending records at today's files if the tracks were regenerated.
+    // 6. Re-point pending records at today's files if their track no longer matches
+    //    (each account keeps its own unique track, never shared).
+    const validSlot = e => tracks.some(t => t.slot === e.generated_track && t.title === e.original_title);
+    const taken = new Set(todayAccounts.filter(a => a.todayEntry.status === 'success' || validSlot(a.todayEntry)).map(a => a.todayEntry.generated_track));
+    const free = shuffle(tracks.filter(t => !taken.has(t.slot)));
     for (const a of pending) {
       const e = a.todayEntry;
-      const t = tracks.find(x => x.slot === e.generated_track) || tracks[0];
-      if (e.original_title !== t.title || e.generated_track !== t.slot) {
-        const keepOriginal = e.published_title === e.original_title;
-        Object.assign(e, await upsertEntry(sb, ctx, a.address, {
-          ...e, generated_track: t.slot, original_title: t.title, published_title: keepOriginal ? t.title : e.published_title,
-        }));
-      }
+      if (validSlot(e)) continue;
+      const t = free.pop();
+      if (!t) throw new Error(`No unassigned track left for ${a.handle || a.address}`);
+      Object.assign(e, await upsertEntry(sb, ctx, a.address, { ...e, generated_track: t.slot, original_title: t.title, published_title: t.title }));
     }
 
-    // 7. Assign tracks/titles to newly selected accounts and reserve them in the database.
+    // 7. Assign one unique track (original title) to each newly selected account and reserve them in the database.
     const queue = pending.map(a => ({ acct: a, entry: a.todayEntry }));
     if (selected.length) {
       for (const a of selected) {
@@ -1060,7 +1042,7 @@ async function runDaily({ now = new Date() } = {}) {
 
     log(`\n[+] Today's accounts to publish (${queue.length}):`);
     queue.forEach(({ acct, entry }, i) => log(
-      `    ${String(i + 1).padStart(2)}. ${acct.handle || acct.address}${acct.isPriority ? ' [priority]' : ''}  -> ${entry.generated_track}  "${entry.published_title}"${entry.published_title === entry.original_title ? ' (original)' : ''}`));
+      `    ${String(i + 1).padStart(2)}. ${acct.handle || acct.address}${acct.isPriority ? ' [priority]' : ''}  -> ${entry.generated_track}  "${entry.published_title}"`));
 
     // 8. Publish sequentially, each account with its own credentials.
     const usedDescriptions = new Set();
@@ -1109,4 +1091,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runDaily, priorityPlan, buildContext };
+module.exports = { runDaily, buildContext, chooseAccounts, assignNewAccounts, batchSizes };

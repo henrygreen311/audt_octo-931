@@ -223,14 +223,21 @@ async function readUpTracks(sb) {
   return data && data[0] ? data[0].up_tracks : null;
 }
 
-function todaysHandles(upTracks, today) {
+// Only the LAST published batch counts: the newest date in up_tracks that has at least one
+// successful upload. Earlier days are ignored completely, and the same accounts stay the
+// targets until upload_track.js publishes a newer batch.
+function latestHandles(upTracks) {
   const days = isObj(upTracks) && Array.isArray(upTracks.days) ? upTracks.days : [];
+  const handleOf = d => (typeof d.handle === 'string' ? d.handle.trim().replace(/^@/, '') : '');
+  const ok = days.filter(d => d && d.status === 'success' && typeof d.date === 'string' && HANDLE_RE.test(handleOf(d)));
+  if (!ok.length) return [];
+  const latest = ok.reduce((m, d) => (d.date > m ? d.date : m), ok[0].date);
   const seen = new Map();
-  for (const d of days) {
-    if (!d || d.date !== today || d.status !== 'success') continue;
-    const h = typeof d.handle === 'string' ? d.handle.trim().replace(/^@/, '') : '';
-    if (!HANDLE_RE.test(h) || seen.has(h.toLowerCase())) continue;
-    seen.set(h.toLowerCase(), { handle: h, address: d.address || null });
+  for (const d of ok) {
+    if (d.date !== latest) continue;
+    const h = handleOf(d);
+    if (seen.has(h.toLowerCase())) continue;
+    seen.set(h.toLowerCase(), { handle: h, address: d.address || null, date: latest });
   }
   return [...seen.values()];
 }
@@ -664,11 +671,12 @@ async function runFollower({ now = new Date() } = {}) {
   const sb = connectSupabase();
   PENDING = loadPending();
 
-  const published = todaysHandles(await readUpTracks(sb), ctx.today);
+  const published = latestHandles(await readUpTracks(sb));
   if (!published.length) {
-    log('[!] No handles published today. Exiting.');
+    log('[!] No successfully published handles found in up_tracks. Exiting.');
     return { status: 'NO_TARGETS' };
   }
+  log(`[*] Targeting the last published batch (${published[0].date}): ${published.length} handle(s).`);
 
   let rows = await fetchRows(sb);
   const coordRaw = rows.find(r => r.address === TARGET_ADDRESS).follower;
@@ -718,4 +726,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runFollower, todaysHandles, buildContext, CFG };
+module.exports = { runFollower, latestHandles, buildContext, CFG };
