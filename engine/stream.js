@@ -9,8 +9,6 @@ const path = require('path');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
-const { AsyncLocalStorage } = require('async_hooks');
-
 const DEFAULT_PROXIES = [
   'https://audius-v2.qringgreen.workers.dev',
   'https://audius-v2.qring99.workers.dev',
@@ -24,106 +22,60 @@ const PROXY_URLS = [...new Set(
     .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean)
 )];
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
-const ACCOUNTS_PER_PROXY = Math.max(1, Number(process.env.ACCOUNTS_PER_PROXY || 2));
-
-// ---------------------------------------------------------------------------
-// Proxy pool: every proxy URL is shared by at most ACCOUNTS_PER_PROXY (2) accounts at a
-// time. A running job holds a "lease" on one proxy slot for its whole life (track info +
-// the full stream), and all of that job's requests go through the leased proxy. Nothing is
-// random: a free slot is always taken from the first healthy proxy (in list order) that
-// still has room, so proxies fill in pairs. When a job ends, its slot is released and
-// handed to the next waiting job.
-// ---------------------------------------------------------------------------
-class ProxyPool {
-  constructor(urls, perProxy) {
-    this.urls = urls;
-    this.per = perProxy;
-    this.load = new Map(urls.map(u => [u, 0]));
-    this.downUntil = new Map();
-    this.waiters = [];
-  }
-  get enabled() { return this.urls.length > 0; }
-  get capacity() { return this.urls.length * this.per; }
-  healthy() {
-    const now = Date.now();
-    const up = this.urls.filter(u => (this.downUntil.get(u) || 0) <= now);
-    return up.length ? up : this.urls; // all down: keep trying them rather than stall
-  }
-  markDown(proxy, ms) { this.downUntil.set(proxy, Date.now() + ms); }
-  // First healthy proxy with a free slot (skipping `exclude`); reserves the slot.
-  take(exclude) {
-    for (const u of this.healthy()) {
-      if (u !== exclude && this.load.get(u) < this.per) {
-        this.load.set(u, this.load.get(u) + 1);
-        return u;
-      }
-    }
-    return null;
-  }
-  give(proxy) {
-    this.load.set(proxy, Math.max(0, this.load.get(proxy) - 1));
-    for (const wake of this.waiters.splice(0)) wake();
-  }
-  // Waits (without polling) until some proxy has a free slot.
-  async acquire() {
-    if (!this.enabled) return { proxy: null, release() {}, move() { return false; } };
-    let proxy;
-    while (!(proxy = this.take())) await new Promise(resolve => this.waiters.push(resolve));
-    const pool = this;
-    const lease = {
-      proxy,
-      released: false,
-      release() { if (lease.released) return; lease.released = true; pool.give(lease.proxy); },
-      // Proxy unreachable: switch to another proxy that has a free slot (the cap still holds).
-      move() {
-        const next = pool.take(lease.proxy);
-        if (!next) return false;
-        pool.give(lease.proxy);
-        lease.proxy = next;
-        return true;
-      },
-    };
-    return lease;
-  }
-}
-const proxyPool = new ProxyPool(PROXY_URLS, ACCOUNTS_PER_PROXY);
-const proxyStore = new AsyncLocalStorage(); // carries the current job's lease through its async calls
-const proxyHost = lease => (lease && lease.proxy ? new URL(lease.proxy).host : '');
-
 {
   const realFetch = globalThis.fetch;
   const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+  // Upstream "bad node" answers (e.g. 503 "database not healthy"): retried on another proxy.
+  const RETRY_STATUS = new Set([502, 503, 504]);
+  const downUntil = new Map();
   const warned = new Set();
   const ATTEMPTS = Number(process.env.PROXY_ATTEMPTS || 6);
-  console.log(proxyPool.enabled
-    ? `[*] Route: Cloudflare proxy pool (${PROXY_URLS.length} proxies x ${ACCOUNTS_PER_PROXY} accounts = ${proxyPool.capacity} concurrent)`
-    : '[*] Route: direct (no proxies configured)');
+  const STATUS_ATTEMPTS = Number(process.env.PROXY_STATUS_ATTEMPTS || 3);
+  const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+  // A fresh proxy is picked for EVERY request (random among the healthy ones); on a retry the
+  // proxy that just failed is avoided when another one is available.
+  const pick = avoid => {
+    const now = Date.now();
+    const up = PROXY_URLS.filter(u => (downUntil.get(u) || 0) <= now);
+    let pool = up.length ? up : PROXY_URLS;
+    if (avoid && pool.length > 1) pool = pool.filter(u => u !== avoid);
+    return pool[Math.floor(Math.random() * pool.length)];
+  };
+  console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
   globalThis.fetch = async (input, init) => {
-    if (!proxyPool.enabled) return realFetch(input, init);
     const isReq = typeof input === 'object' && input !== null && 'url' in input;
     let url;
     try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
     if (url.hostname !== 'api.audius.co') return realFetch(input, init);
     const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
     if (PROXY_KEY) headers.set('x-proxy-key', PROXY_KEY);
-    const lease = proxyStore.getStore() || null; // the calling job's proxy slot (none outside a job)
     let lastErr;
+    let lastProxy = null;
+    let statusTries = 0;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-      const proxy = lease ? lease.proxy : proxyPool.healthy()[0];
+      const proxy = pick(lastProxy);
+      lastProxy = proxy;
       const target = proxy + url.pathname + url.search;
+      let res;
       try {
-        return isReq && !init
+        res = isReq && !init
           ? await realFetch(new Request(target, input.clone()), { headers })
           : await realFetch(target, { ...init, headers });
       } catch (e) {
         const code = e && ((e.cause && e.cause.code) || e.code);
         if (!CONNECT_ERRS.has(code)) throw e;
         lastErr = e;
-        proxyPool.markDown(proxy, 20000);
-        if (!warned.has(proxy)) { warned.add(proxy); console.log(`[!] Proxy ${new URL(proxy).host} unreachable; moving jobs to another proxy.`); }
-        if (lease) lease.move(); // only succeeds if another proxy has a free slot; otherwise retry this one
-        await new Promise(r => setTimeout(r, 300 * attempt));
+        downUntil.set(proxy, Date.now() + 20000);
+        if (!warned.has(proxy)) { warned.add(proxy); console.log(`[!] Proxy ${new URL(proxy).host} unreachable; using another.`); }
+        await sleepMs(300 * attempt);
+        continue;
       }
+      if (RETRY_STATUS.has(res.status) && ++statusTries < STATUS_ATTEMPTS) {
+        try { if (res.body) await res.body.cancel(); } catch (_) {}
+        await sleepMs(500 * statusTries);
+        continue; // next request goes out through a different proxy
+      }
+      return res;
     }
     throw lastErr;
   };
@@ -181,12 +133,13 @@ const CFG = {
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
   retryBaseMs: Number(process.env.RETRY_BASE_MS || 2000),
   failStopAfter: Number(process.env.FAIL_STOP_AFTER || 30),
+  playRetries: Number(process.env.PLAY_RETRIES || 4), // tries per stream when Audius answers 5xx
   stallMs: Number(process.env.STREAM_STALL_SECONDS || 15) * 1000,
   bufferMs: Number(process.env.STREAM_BUFFER_SECONDS || 10) * 1000,
   assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
-  concurrency: Number(process.env.CONCURRENCY || 12),
+  concurrency: Number(process.env.CONCURRENCY || 10),
 };
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -616,8 +569,7 @@ async function playStream(streamUrl, playMs, durationSec) {
 async function streamJob(sb, ctx, run, acct, target) {
   const st = run.stats;
   const who = acct.handle ? `@${acct.handle}` : acct.address;
-  let lease = null;
-  const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id}${lease && lease.proxy ? ` via ${proxyHost(lease)}` : ''} | ${text}`); };
+  const say = text => { if (VERBOSE) log(`[*] ${who} -> track ${target.id} | ${text}`); };
   let result = null;
   let outcome;
   let stage = 'trackInfo';
@@ -630,20 +582,26 @@ async function streamJob(sb, ctx, run, acct, target) {
     let sdk = run.sdks.get(acct.address);
     if (!sdk) { sdk = makeSdk(acct); run.sdks.set(acct.address, sdk); }
 
-    // Take a proxy slot (waits if every proxy already has its 2 accounts). Every request
-    // this job makes, track info and the stream itself, goes through that proxy.
-    lease = await proxyPool.acquire();
-    await proxyStore.run(lease, async () => {
+    // A 5xx from Audius (e.g. 503 "database not healthy") means the node that answered is
+    // unhealthy, not that this account is bad. Retry with backoff; each request goes out through
+    // a freshly picked proxy, and the cached track info / signed stream URL is dropped so the
+    // retry asks for a new one.
+    result = await withRetry(async () => {
+      stage = 'trackInfo';
       const meta = await getTrackMeta(run, target, sdk);
       let playMs = CFG.streamDurationMs;
       if (ordinal >= CFG.fullPlayAt) {
         playMs = (meta.duration + 5) * 1000;
         say(`playing full track (~${meta.duration}s)`);
       }
-
       stage = 'play';
-      result = await playStream(meta.streamUrl, playMs, meta.duration);
-    });
+      return playStream(meta.streamUrl, playMs, meta.duration);
+    }, e => {
+      if (e && e.interrupted) return false; // already received audio: never replay
+      const code = statusOf(e);
+      if (code >= 500 || code === 408) { run.meta.delete(target.key); say(`${stage}: ${reason(e)}; retrying`); return true; }
+      return false;
+    }, CFG.playRetries);
     run.consecFail = 0;
     outcome = 'ok';
     st.ok++;
@@ -659,8 +617,6 @@ async function streamJob(sb, ctx, run, acct, target) {
       run.stop = true;
       log('[!] Too many failures in a row; stopping. Next run resumes.');
     }
-  } finally {
-    if (lease) lease.release(); // free the proxy slot for the next waiting account
   }
 
   if (result) {
@@ -675,19 +631,13 @@ async function streamJob(sb, ctx, run, acct, target) {
       if (e instanceof LockLostError) run.abort = e;
     }
     acct.today++;
-    const detail = `${(result.playbackMs / 1000).toFixed(1)}s played in ${(result.wallMs / 1000).toFixed(1)}s, ${Math.round(result.bytes / 1024)} KB${result.ended ? ', stream ended' : ''}, HTTP ${result.status} ${result.contentType}, user ${acct.user_id}${lease && lease.proxy ? `, proxy ${proxyHost(lease)}` : ''}`;
+    const detail = `${(result.playbackMs / 1000).toFixed(1)}s played in ${(result.wallMs / 1000).toFixed(1)}s, ${Math.round(result.bytes / 1024)} KB${result.ended ? ', stream ended' : ''}, HTTP ${result.status} ${result.contentType}, user ${acct.user_id}`;
     if (!saved) log(`[!] ${who} -> track ${target.id} | completed (${detail}), DB save failed (kept locally)`);
     else say(`completed: ${detail}`);
   }
 
   if (CFG.streamDelayMs) await sleep(CFG.streamDelayMs);
   return outcome;
-}
-
-// Concurrent jobs can never exceed the proxy slots (proxies x accounts-per-proxy).
-function effectiveConcurrency() {
-  const c = Math.max(1, CFG.concurrency);
-  return proxyPool.enabled ? Math.min(c, proxyPool.capacity) : c;
 }
 
 async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
@@ -717,7 +667,7 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
     if (outcome === 'ok') got++;
     return true;
   };
-  await Promise.all(Array.from({ length: effectiveConcurrency() }, async () => { while (await step()); }));
+  await Promise.all(Array.from({ length: Math.max(1, CFG.concurrency) }, async () => { while (await step()); }));
   return { got, started, skipped: started - got };
 }
 
@@ -793,12 +743,6 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   }
 
   const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
-  if (proxyPool.enabled) {
-    log(`[*] Concurrency: ${effectiveConcurrency()} jobs (${proxyPool.urls.length} proxies x ${proxyPool.per} accounts each).`);
-    if (CFG.concurrency > proxyPool.capacity) {
-      log(`[!] CONCURRENCY=${CFG.concurrency} is more than the proxy slots available (${proxyPool.capacity}). Add proxy URLs (AUDIUS_PROXY_URLS) or raise ACCOUNTS_PER_PROXY to use all ${CFG.concurrency}.`);
-    }
-  }
   log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} streams.`);
 
   if (!batch) {
@@ -821,6 +765,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !run.cool.has(a.address));
     const order = shuffle(pool).sort((x, y) => x.today - y.today);
     const candidates = order.length ? Array.from({ length: n.attempts }, (_, i) => order[i % order.length]) : [];
+    log(`[*] Streaming ${t.id} | target ${(todayDone.get(t.key) || 0) + Math.min(n.attempts, n.maxOk)}`);
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     const day = (todayDone.get(t.key) || 0) + got;
@@ -905,4 +850,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runStream, collectTracks, buildContext, CFG, ProxyPool, proxyPool, proxyStore, effectiveConcurrency };
+module.exports = { runStream, collectTracks, buildContext, CFG };
