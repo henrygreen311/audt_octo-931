@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-const STREAM_DURATION_MS = 40000;
+const STREAM_DURATION_MS = 60000;
 
 const fs = require('fs');
 const os = require('os');
@@ -79,7 +79,6 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
 }
 
 const log = console.log.bind(console);
-// Changed to let so we can dynamically toggle it during the stream
 let VERBOSE = /^(1|true|yes)$/i.test(process.env.VERBOSE || '') || process.argv.includes('--verbose') || process.argv.includes('-v');
 let lastBgLog = 0;
 process.on('unhandledRejection', e => {
@@ -124,7 +123,6 @@ const CFG = {
   dailyPerTrack: Number(process.env.DAILY_STREAMS_PER_TRACK || 1000),
   maxStreamsPerRun: Number(process.env.MAX_STREAMS_PER_RUN || process.env.MAX_STREAMS_PER_RUN_TODAY || 100),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || STREAM_DURATION_MS),
-  fullPlayAt: Number(process.env.FULL_PLAY_AT_STREAM || 100),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
@@ -137,8 +135,6 @@ const CFG = {
   assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
-  // FIXED: Back to sequential
-  concurrency: 1,
 };
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -435,7 +431,6 @@ async function getTrackMeta(run, target, sdk) {
       if (!d) throw new Error('track info missing');
 
       const duration = Number(d.duration);
-      
       const streamUrl = d.stream && d.stream.url;
       if (!streamUrl) throw new Error('track has no stream URL (may be gated)');
 
@@ -568,22 +563,17 @@ async function streamJob(sb, ctx, run, acct, target) {
   let stage = 'trackInfo';
 
   try {
-    const sent = run.started.get(target.key) || 0;
-    run.started.set(target.key, sent + 1);
-    const ordinal = (run.todayDone.get(target.key) || 0) + sent + 1;
-
     let sdk = run.sdks.get(acct.address);
     if (!sdk) { sdk = makeSdk(acct); run.sdks.set(acct.address, sdk); }
 
     result = await withRetry(async () => {
       stage = 'trackInfo';
       const meta = await getTrackMeta(run, target, sdk);
+      
+      // FIXED: Strictly use the configured STREAM_DURATION_MS
       let playMs = CFG.streamDurationMs;
-      if (ordinal >= CFG.fullPlayAt) {
-        playMs = (meta.duration + 5) * 1000;
-        say(`playing full track (~${meta.duration}s)`);
-      }
       stage = 'play';
+      
       return playStream(meta.streamUrl, playMs, meta.duration);
     }, e => {
       if (e && e.interrupted) return false; 
@@ -629,7 +619,6 @@ async function streamJob(sb, ctx, run, acct, target) {
   return outcome;
 }
 
-// FIXED: Restored to sequential execution
 async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let got = 0;
   let started = 0;
@@ -749,15 +738,11 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const order = shuffle(pool).sort((x, y) => x.today - y.today);
     const candidates = order.length ? Array.from({ length: n.attempts }, (_, i) => order[i % order.length]) : [];
     
-    // Print the target line
     log(`[*] Streaming ${t.id} | target ${(todayDone.get(t.key) || 0) + Math.min(n.attempts, n.maxOk)}`);
-    
-    // Turn on verbose logging dynamically for this track's streams
     VERBOSE = true;
     
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     
-    // Turn off verbose logging to keep the next track's logs clean
     VERBOSE = false;
     
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;

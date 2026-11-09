@@ -18,24 +18,17 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT_DIR))
 
-# Set to True to run stream.js in the background while the main pipeline runs.
 STREAM_ENABLED = True  
 
-# Set to False to completely mute stream.js logs (it will still run silently)
 STREAM_SHOW_LOGS = True
 
-# Set to True to run "follower.js id=2" (follower booster) in the background.
-# It starts only after the normal follower.js step of the pipeline has finished (so the
-# two never run at the same time) and is stopped as soon as stream.js completes.
-BOOST_ENABLED = True
+BOOST_ENABLED = False
 
-# Set to False to completely mute the follower.js id=2 logs (it will still run silently)
 BOOST_SHOW_LOGS = True
 
 # Prefix added to every follower.js id=2 log line so it is easy to tell apart ("" to disable)
 BOOST_LOG_PREFIX = "[boost] "
 
-# Set to False to completely mute the main pipeline logs (upload, follower, etc.)
 PIPELINE_SHOW_LOGS = False
 
 PIPELINE = [
@@ -45,7 +38,6 @@ PIPELINE = [
     ("repost.js", True),
     ("comment.js", True),
 ]
-# =====================================================================
 
 async def stream_reader(stream, is_stderr=False, silent=False, prefix=""):
     """Reads stdout/stderr from the subprocess line-by-line and prints immediately."""
