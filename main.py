@@ -24,7 +24,7 @@ STREAM_SHOW_LOGS = True
 
 BOOST_ENABLED = True
 
-BOOST_SHOW_LOGS = True
+BOOST_SHOW_LOGS = False
 
 # Prefix added to every follower.js id=2 log line so it is easy to tell apart ("" to disable)
 BOOST_LOG_PREFIX = "[boost] "
