@@ -147,7 +147,7 @@ const CFG = {
   assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
-  workerCount: 10, // 10 dedicated workers
+  workerCount: 6, // Changed from 10 to 6 to match the proxy count
 };
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -635,7 +635,7 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let stopWorkers = false;
 
   const worker = async (id) => {
-    // Split the proxies across the workers: Worker 1 -> Proxy 0, Worker 7 -> Proxy 0, etc.
+    // Split the proxies across the workers: Worker 1 -> Proxy 0, Worker 2 -> Proxy 1, etc.
     const proxy = PROXY_URLS[(id - 1) % PROXY_URLS.length];
     
     return asyncLocalStorage.run({ proxy }, async () => {
