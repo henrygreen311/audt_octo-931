@@ -7,7 +7,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
-const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS || 'https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev,https://audius-v2.qringgreen.workers.dev,https://audius-v2.qring99.workers.dev,https://audius.henrygreen311.workers.dev,https://audius-v2.henrygreen311.workers.dev')
+const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS || 'https://audius-v2.qringgreen.workers.dev,https://audius-v2.qring99.workers.dev,https://audius.henrygreen311.workers.dev,https://audius-v2.henrygreen311.workers.dev,https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev')
   .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
 {
@@ -917,14 +917,35 @@ async function runBoost() {
   }
 }
 
+async function runList() {
+  const sb = connectSupabase();
+  const accounts = await fetchBoostAccounts(sb);
+  const reader = shuffle(accounts.filter(hasCreds))[0];
+  if (!reader) throw new Error('no account with complete credentials');
+  const sdk = makeSdk(reader);
+  const counts = await loadFollowerCounts(sdk, accounts.filter(a => a.user_id).map(a => String(a.user_id)));
+  const rows = accounts.map(a => ({
+    name: a.handle ? `@${String(a.handle).replace(/^@/, '')}` : a.address,
+    count: a.user_id && counts.has(String(a.user_id)) ? counts.get(String(a.user_id)) : null,
+  })).sort((x, y) => (x.count === null) - (y.count === null) || x.count - y.count || x.name.localeCompare(y.name));
+  for (const r of rows) log(`[*] ${r.name} | ${r.count === null ? 'n/a' : r.count}`);
+  const known = rows.filter(r => r.count !== null);
+  const low = known.filter(r => r.count < BOOST.targetFollowers).length;
+  const mid = known.filter(r => r.count >= BOOST.targetFollowers && r.count < BOOST.maxFollowers).length;
+  const high = known.length - low - mid;
+  const total = known.reduce((n, r) => n + r.count, 0);
+  log(`[*] ${rows.length} accounts | under ${BOOST.targetFollowers}: ${low} | ${BOOST.targetFollowers}-${BOOST.maxFollowers - 1}: ${mid} | ${BOOST.maxFollowers}+: ${high}${rows.length > known.length ? ` | n/a: ${rows.length - known.length}` : ''} | ${total} followers in total`);
+}
+
 const MODE_ARG = process.argv.slice(2).find(a => /^id=/.test(a));
 
 if (require.main === module) {
   let task;
   if (!MODE_ARG) task = runFollower();
   else if (MODE_ARG === 'id=2') task = runBoost();
+  else if (MODE_ARG === 'id=3') task = runList().then(() => process.exit(0));
   else {
-    console.error(`[!] Unknown mode "${MODE_ARG}". Use no argument, or id=2.`);
+    console.error(`[!] Unknown mode "${MODE_ARG}". Use no argument, id=2 or id=3.`);
     process.exit(1);
   }
   task.catch(err => {
@@ -933,4 +954,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runFollower, runBoost, latestHandles, buildContext, CFG };
+module.exports = { runFollower, runBoost, runList, latestHandles, buildContext, CFG };
