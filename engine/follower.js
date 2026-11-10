@@ -721,11 +721,20 @@ async function runFollower({ now = new Date() } = {}) {
 
 const BOOST = {
   targetFollowers: Number(process.env.BOOST_TARGET_FOLLOWERS || 50),
-  maxFollowers: Number(process.env.BOOST_MAX_FOLLOWERS || 100),
+  maxFollowers: Number(process.env.BOOST_MAX_FOLLOWERS || 300),
+  step: Number(process.env.BOOST_STEP || 50),
   batchSize: Number(process.env.BOOST_BATCH_SIZE || 5),
   waitMs: Number(process.env.BOOST_WAIT_MINUTES || 2) * 60000,
   countBatch: 50,
 };
+
+function boostTiers() {
+  const tiers = [];
+  const step = Math.max(1, BOOST.step);
+  for (let t = BOOST.targetFollowers; t < BOOST.maxFollowers; t += step) tiers.push(t);
+  tiers.push(Math.max(BOOST.maxFollowers, BOOST.targetFollowers));
+  return tiers;
+}
 
 async function fetchBoostAccounts(sb) {
   const out = [];
@@ -852,7 +861,7 @@ async function boostBatch(state, sb, batchNo) {
   const reader = shuffle(withCreds)[0];
   const sdk = makeSdk(reader);
   const counts = await loadFollowerCounts(sdk, accounts.filter(a => a.user_id).map(a => String(a.user_id)));
-  const tiers = BOOST.maxFollowers > BOOST.targetFollowers ? [BOOST.targetFollowers, BOOST.maxFollowers] : [BOOST.targetFollowers];
+  const tiers = boostTiers();
   let goal = 0;
   let low = [];
   for (const tier of tiers) {
@@ -883,7 +892,7 @@ async function boostBatch(state, sb, batchNo) {
     const have = counts.get(id);
     const need = goal - have;
     let existing = null;
-    try { existing = await loadFollowerIds(sdk, id, 200); } catch (_) { existing = null; }
+    try { existing = await loadFollowerIds(sdk, id, Math.max(200, have + 100)); } catch (_) { existing = null; }
     const pool = withCreds.filter(a => String(a.user_id) !== id && !state.cool.has(a.address) && !(existing && existing.has(String(a.user_id))));
     const target = { id, handle: acct.handle || acct.address };
     if (!pool.length) {
@@ -930,11 +939,16 @@ async function runList() {
   })).sort((x, y) => (x.count === null) - (y.count === null) || x.count - y.count || x.name.localeCompare(y.name));
   for (const r of rows) log(`[*] ${r.name} | ${r.count === null ? 'n/a' : r.count}`);
   const known = rows.filter(r => r.count !== null);
-  const low = known.filter(r => r.count < BOOST.targetFollowers).length;
-  const mid = known.filter(r => r.count >= BOOST.targetFollowers && r.count < BOOST.maxFollowers).length;
-  const high = known.length - low - mid;
+  const tiers = boostTiers();
+  const bands = [{ label: `under ${tiers[0]}`, n: known.filter(r => r.count < tiers[0]).length }];
+  tiers.forEach((t, i) => {
+    const next = tiers[i + 1];
+    bands.push(next === undefined
+      ? { label: `${t}+`, n: known.filter(r => r.count >= t).length }
+      : { label: `${t}-${next - 1}`, n: known.filter(r => r.count >= t && r.count < next).length });
+  });
   const total = known.reduce((n, r) => n + r.count, 0);
-  log(`[*] ${rows.length} accounts | under ${BOOST.targetFollowers}: ${low} | ${BOOST.targetFollowers}-${BOOST.maxFollowers - 1}: ${mid} | ${BOOST.maxFollowers}+: ${high}${rows.length > known.length ? ` | n/a: ${rows.length - known.length}` : ''} | ${total} followers in total`);
+  log(`[*] ${rows.length} accounts | ${bands.map(b => `${b.label}: ${b.n}`).join(' | ')}${rows.length > known.length ? ` | n/a: ${rows.length - known.length}` : ''} | ${total} followers in total`);
 }
 
 const MODE_ARG = process.argv.slice(2).find(a => /^id=/.test(a));
