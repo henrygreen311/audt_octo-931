@@ -723,7 +723,7 @@ const BOOST = {
   targetFollowers: Number(process.env.BOOST_TARGET_FOLLOWERS || 50),
   maxFollowers: Number(process.env.BOOST_MAX_FOLLOWERS || 300),
   step: Number(process.env.BOOST_STEP || 50),
-  batchSize: Number(process.env.BOOST_BATCH_SIZE || 5),
+  batchSize: Number(process.env.BOOST_BATCH_SIZE || 10),
   waitMs: Number(process.env.BOOST_WAIT_MINUTES || 2) * 60000,
   countBatch: 50,
 };
