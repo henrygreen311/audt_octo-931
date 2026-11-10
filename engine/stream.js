@@ -147,8 +147,8 @@ const CFG = {
   assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
-  workerCount: 6,
-  // NEW: Stagger config - 5s between each worker + small random jitter
+  workerCount: 10, // UPDATED: 10 workers
+  // Stagger config - 5s between each worker + small random jitter
   workerStaggerMs: Number(process.env.WORKER_STAGGER_MS || 5000),
   workerJitterMs: Number(process.env.WORKER_JITTER_MS || 2000),
 };
@@ -638,11 +638,13 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let stopWorkers = false;
 
   const worker = async (id) => {
+    // Split the proxies across the workers. Workers 1-6 get proxies 1-6. 
+    // Workers 7-10 wrap around and get proxies 1-4.
     const proxy = PROXY_URLS[(id - 1) % PROXY_URLS.length];
     
     return asyncLocalStorage.run({ proxy }, async () => {
-      // NEW: Stagger each worker by (id-1) * workerStaggerMs + random jitter
-      // Worker 1: 0s, Worker 2: ~5s, Worker 3: ~10s, Worker 4: ~15s, Worker 5: ~20s, Worker 6: ~25s
+      // Stagger each worker by (id-1) * workerStaggerMs + random jitter
+      // Worker 1: 0s, Worker 2: ~5s, ... Worker 10: ~45s
       const staggerDelay = (id - 1) * CFG.workerStaggerMs + Math.floor(Math.random() * CFG.workerJitterMs);
       
       log(`[worker${id}] Streaming ${target.id} | target ${maxOk} (starting in ${(staggerDelay / 1000).toFixed(1)}s)`);
