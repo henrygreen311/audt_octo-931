@@ -51,15 +51,15 @@ const STATE_FILE = path.join(ROOT_DIR, '.audius_daily_state.json');
 const TARGET_ADDRESS = 'qringgreen@gmail.com';
 
 const CFG = {
-  timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
+  timezone: process.env.RESET_TIMEZONE || 'America/Los_Angeles', // Audius trending resets weekly on Pacific time
+  resetHour: Number(process.env.RESET_HOUR ?? 12), // the weekly reset happens on Friday at 12:00 PM Pacific
   accountsPerDay: 10,            // accounts published per batch (one track each)
   tracksPerDay: 10,              // tracks generated per batch: one unique track per account
   trackBatchSize: 3,             // generated as 3 + 3 + 3 + 1; each batch is downloaded before the next starts
   maxPriorityPerBatch: 7,        // up to 7 priority accounts per batch; the remaining slots are random
-  // Publishing days in the Saturday-based week (0=Sat 1=Sun 2=Mon 3=Tue 4=Wed 5=Thu 6=Fri):
-  // Saturday (reset day, 1st batch) and Tuesday (3 days later, 2nd batch) = twice a week.
-  publishDayIndexes: [0, 3],
-  forceRun: process.env.FORCE_RUN === '1', // run even on a non-publishing day
+  // One batch per week. A week runs from Friday 12:00 PM Pacific to the next Friday 11:59 AM, and the
+  // batch is published whenever the script runs at or after the reset time and the week has no batch yet.
+  forceRun: process.env.FORCE_RUN === '1', // start another batch even though this week's batch exists
   priorityHandles: ['qring', 'obi350965', '7ebe3e67', '904c4687', '4c9ebc6a', 'd71a941b', 'a8cde724', 'b41ba8a6', 'e8b592ac'],
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   // A lock of unknown ownership with no data recorded for today is treated as stale after this long (0 = off).
@@ -73,7 +73,7 @@ const CFG = {
   uploadDelayMs: Number(process.env.UPLOAD_DELAY_MS || 1500),
 };
 
-const ALREADY_DONE_MSG = "[!] Today's publishing batch has already been completed. Exiting.";
+const ALREADY_DONE_MSG = "[!] This week's publishing batch has already been completed. Exiting.";
 
 // ---------------------------------------------------------------------------
 // Description generator (unchanged from the working implementation)
@@ -243,7 +243,7 @@ async function describeError(err) {
 }
 
 // ---------------------------------------------------------------------------
-// Date / week helpers (Saturday-based week in the configured timezone)
+// Date / week helpers (week starts Friday at 12:00 PM Pacific; the clock is shifted back by resetHour)
 // ---------------------------------------------------------------------------
 function addDays(ymd, n) {
   const [y, m, d] = ymd.split('-').map(Number);
@@ -255,18 +255,15 @@ function buildContext(now) {
   try {
     parts = new Intl.DateTimeFormat('en-US', {
       timeZone: CFG.timezone, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long',
-    }).formatToParts(now);
+    }).formatToParts(new Date(now.getTime() - CFG.resetHour * 3600000));
   } catch (e) {
-    throw new Error(`Invalid PUBLISH_TIMEZONE "${CFG.timezone}": ${e.message}`);
+    throw new Error(`Invalid RESET_TIMEZONE "${CFG.timezone}": ${e.message}`);
   }
   const p = {};
   for (const x of parts) p[x.type] = x.value;
   const today = `${p.year}-${p.month}-${p.day}`;
-  const dayIndex = ['Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'].indexOf(p.weekday);
-  return {
-    today, dayName: p.weekday, dayIndex, weekStart: addDays(today, -dayIndex), tz: CFG.timezone,
-    isPublishDay: CFG.publishDayIndexes.includes(dayIndex),
-  };
+  const dayIndex = ['Friday', 'Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday'].indexOf(p.weekday);
+  return { today, dayName: p.weekday, dayIndex, weekStart: addDays(today, -dayIndex), tz: CFG.timezone };
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +278,10 @@ const isCurrentWeek = (raw, weekStart) => isObj(raw) && raw.week_start === weekS
 
 function normalizeHistory(raw, weekStart) {
   if (isCurrentWeek(raw, weekStart)) return { ...raw, days: raw.days.map(d => ({ ...d })) };
+  if (isObj(raw) && Array.isArray(raw.days) && raw.days.length) {
+    const end = addDays(weekStart, 7);
+    if (raw.days.every(d => d.date >= weekStart && d.date < end)) return { ...raw, week_start: weekStart, days: raw.days.map(d => ({ ...d })) };
+  }
   const h = { week_start: weekStart, days: [] }; // new week (or default []): previous history dropped
   if (isObj(raw) && raw.lock) h.lock = raw.lock;
   return h;
@@ -381,7 +382,7 @@ async function upsertEntry(sb, ctx, address, patch) {
   return saved;
 }
 
-// Saturday reset: if the history row is not for the current week it is re-initialised
+// Weekly reset (Friday 12:00 PM Pacific): if the history row is not for the current week it is re-initialised
 // (days emptied, lock kept). A row already holding the current week is left untouched.
 async function weeklyResetPass(sb, rows, ctx) {
   const row = rows.find(r => r.address === TARGET_ADDRESS);
@@ -404,6 +405,16 @@ function lockOwnerAlive(lock) {
 }
 
 // Does the stored history hold ANY entry for today? ("days": [] => no.)
+function adoptWeekBatch(rows, ctx) {
+  if (CFG.forceRun) return;
+  const row = rows.find(r => r.address === TARGET_ADDRESS);
+  const days = normalizeHistory(row && row.up_tracks, ctx.weekStart).days.filter(d => d.date);
+  if (!days.length) return;
+  const first = days.reduce((a, d) => (d.date < a.date ? d : a), days[0]);
+  ctx.today = first.date;
+  if (first.day) ctx.dayName = first.day;
+}
+
 function hasDataForToday(rows, ctx) {
   const row = rows.find(r => r.address === TARGET_ADDRESS);
   return normalizeHistory(row && row.up_tracks, ctx.weekStart).days.some(d => d.date === ctx.today);
@@ -911,7 +922,7 @@ function printSummary(ctx, accounts, tracksCount, status, failures) {
   log('AUDIUS PUBLISHING SUMMARY');
   log('==============================');
   log(`Date: ${ctx.today} (${ctx.dayName}, ${ctx.tz})`);
-  log(`Week start (Saturday): ${ctx.weekStart}\n`);
+  log(`Week start (Friday 12:00 PM ${ctx.tz}): ${ctx.weekStart}\n`);
   log(`Accounts selected: ${today.length}`);
   log(`Tracks generated: ${tracksCount}`);
   log(`Tracks published: ${ok.length}\n`);
@@ -937,16 +948,12 @@ function printSummary(ctx, accounts, tracksCount, status, failures) {
 async function runDaily({ now = new Date() } = {}) {
   const ctx = buildContext(now);
   const sb = connectSupabase();
-  log(`[*] Publishing date ${ctx.today} (${ctx.dayName}, ${ctx.tz}); week starts Saturday ${ctx.weekStart}.`);
-  if (!ctx.isPublishDay && !CFG.forceRun) {
-    log(`[!] ${ctx.dayName} is not a publishing day (batches run every 3 days, twice a week: Saturday and Tuesday). Exiting. Set FORCE_RUN=1 to override.`);
-    return { status: 'NOT_SCHEDULED' };
-  }
-
   // 1. Duplicate-run check against the database BEFORE generating or selecting anything.
   let rows = await fetchAllRows(sb);
   if (!rows.length) throw new Error('audius table returned no accounts');
   if (!rows.some(r => r.address === TARGET_ADDRESS)) throw new Error(`history row not found in audius table: ${TARGET_ADDRESS}`);
+  adoptWeekBatch(rows, ctx);
+  log(`[*] Publishing date ${ctx.today} (${ctx.dayName}, ${ctx.tz}); week starts Friday 12:00 PM ${ctx.weekStart}.`);
   if (isBatchComplete(buildAccounts(rows, ctx))) {
     log(ALREADY_DONE_MSG);
     return { status: 'ALREADY_COMPLETED' };
@@ -960,6 +967,7 @@ async function runDaily({ now = new Date() } = {}) {
   try {
     // 3. Re-check under the lock, then handle the weekly reset and interrupted runs.
     rows = await fetchAllRows(sb);
+    adoptWeekBatch(rows, ctx);
     if (isBatchComplete(buildAccounts(rows, ctx))) {
       log(ALREADY_DONE_MSG);
       return { status: 'ALREADY_COMPLETED' };
@@ -970,6 +978,7 @@ async function runDaily({ now = new Date() } = {}) {
     let accounts = buildAccounts(rows, ctx);
     const blocked = await reconcileAmbiguous(sb, accounts, ctx, journal);
     rows = await fetchAllRows(sb);
+    adoptWeekBatch(rows, ctx);
     accounts = buildAccounts(rows, ctx);
     if (isBatchComplete(accounts)) {
       log(ALREADY_DONE_MSG);

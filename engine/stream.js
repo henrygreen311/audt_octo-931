@@ -131,7 +131,8 @@ const STATE_FILE = path.join(ROOT_DIR, '.audius_stream_state.json');
 const TARGET_ADDRESS = 'qringgreen@gmail.com';
 
 const CFG = {
-  timezone: process.env.PUBLISH_TIMEZONE || 'UTC',
+  timezone: process.env.RESET_TIMEZONE || 'America/Los_Angeles',
+  resetHour: Number(process.env.RESET_HOUR ?? 12),
   dailyPerTrack: Number(process.env.DAILY_STREAMS_PER_TRACK || 1000),
   maxStreamsPerRun: Number(process.env.MAX_STREAMS_PER_RUN || process.env.MAX_STREAMS_PER_RUN_TODAY || 100),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || STREAM_DURATION_MS),
@@ -216,14 +217,14 @@ function buildContext(now) {
   try {
     parts = new Intl.DateTimeFormat('en-US', {
       timeZone: CFG.timezone, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long',
-    }).formatToParts(now);
+    }).formatToParts(new Date(now.getTime() - CFG.resetHour * 3600000));
   } catch (e) {
-    throw new Error(`Invalid PUBLISH_TIMEZONE "${CFG.timezone}": ${e.message}`);
+    throw new Error(`Invalid RESET_TIMEZONE "${CFG.timezone}": ${e.message}`);
   }
   const p = {};
   for (const x of parts) p[x.type] = x.value;
   const today = `${p.year}-${p.month}-${p.day}`;
-  const dayIndex = ['Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'].indexOf(p.weekday);
+  const dayIndex = ['Friday', 'Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday'].indexOf(p.weekday);
   return { today, dayName: p.weekday, dayIndex, weekStart: addDays(today, -dayIndex), tz: CFG.timezone };
 }
 
@@ -286,8 +287,20 @@ function collectTracks(upTracks) {
   return [...seen.values()];
 }
 
+function sameWeek(raw, weekStart) {
+  if (!isObj(raw)) return false;
+  if (raw.week_start === weekStart) return true;
+  if (!Array.isArray(raw.runs) || !raw.runs.length) return false;
+  const end = addDays(weekStart, 7);
+  return raw.runs.every(r => r.date >= weekStart && r.date < end);
+}
+
 function normalizeStream(raw, weekStart) {
-  if (isObj(raw) && raw.week_start === weekStart && Array.isArray(raw.runs)) return JSON.parse(JSON.stringify(raw));
+  if (sameWeek(raw, weekStart) && Array.isArray(raw.runs)) {
+    const h = JSON.parse(JSON.stringify(raw));
+    h.week_start = weekStart;
+    return h;
+  }
   const h = { week_start: weekStart, runs: [] };
   if (isObj(raw) && raw.lock) h.lock = raw.lock;
   return h;
@@ -355,7 +368,7 @@ async function flushPending(sb, ctx) {
   if (!PENDING.length) return;
   const keep = [];
   for (const p of PENDING) {
-    if (p.week_start !== ctx.weekStart) continue;
+    if (!(p.date >= ctx.weekStart && p.date < addDays(ctx.weekStart, 7))) continue;
     try { await recordStream(sb, ctx.weekStart, p.address, p); } catch (_) { keep.push(p); }
   }
   log(`[*] Recovered ${PENDING.length - keep.length}/${PENDING.length} unsaved streams.`);
@@ -690,7 +703,7 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
 
 function countToday(raw, ctx) {
   let n = 0;
-  if (isObj(raw) && raw.week_start === ctx.weekStart && Array.isArray(raw.runs)) {
+  if (sameWeek(raw, ctx.weekStart) && Array.isArray(raw.runs)) {
     for (const r of raw.runs) if (r.date === ctx.today) for (const t of (r.tracks || [])) if (t.status === 'success') n += t.count || 1;
   }
   return n;
@@ -700,7 +713,7 @@ function countTracks(rows, ctx, runNumber) {
   const counts = new Map();
   for (const r of rows) {
     const f = r.stream;
-    if (!isObj(f) || f.week_start !== ctx.weekStart || !Array.isArray(f.runs)) continue;
+    if (!isObj(f) || !sameWeek(f, ctx.weekStart) || !Array.isArray(f.runs)) continue;
     for (const x of f.runs) {
       if (x.date !== ctx.today || (runNumber !== undefined && x.run_number !== runNumber)) continue;
       for (const t of x.tracks || []) {
@@ -833,7 +846,7 @@ async function runStream({ now = new Date() } = {}) {
 
   let rows = await fetchRows(sb);
   const coordRaw = rows.find(r => r.address === TARGET_ADDRESS).stream;
-  if (isObj(coordRaw) && coordRaw.week_start && coordRaw.week_start !== ctx.weekStart) {
+  if (isObj(coordRaw) && coordRaw.week_start && !sameWeek(coordRaw, ctx.weekStart)) {
     log('[*] New week: history reset.');
   }
   if (!tracksBelowCap(rows, published, ctx).length) {
