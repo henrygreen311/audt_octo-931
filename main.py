@@ -121,20 +121,57 @@ async def run_module(module_name: str, silent: bool = False, args=None, holder=N
         print(f"[!] Module '{module_name}' does not have a 'run()' function.", flush=True)
     return 1
 
-def start_boost(holder):
-    """Starts follower.js id=2 in the background; it keeps running until it stops itself."""
+async def stop_background(task, holder, label: str, show: bool):
+    """Stops a background module (SIGTERM, then SIGKILL after 10s) and waits for it to exit."""
+    proc = holder.get("proc")
+    if proc is not None and proc.returncode is None:
+        holder["stopping"] = True
+        if show:
+            print(f"[*] Stopping {label}...", flush=True)
+        proc.terminate()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+    try:
+        await task
+    except Exception:
+        pass
+
+async def stop_when_done(stream_task, boost_task, holder, show: bool):
+    """Stops the follower booster the moment stream.js completes (success or failure)."""
+    try:
+        await stream_task
+    except Exception:
+        pass
+    await stop_background(boost_task, holder, "follower.js id=2", show)
+
+def start_boost(stream_task, holder):
+    """Starts follower.js id=2 in the background (unless stream.js has already completed)."""
+    if stream_task is not None and stream_task.done():
+        if BOOST_SHOW_LOGS:
+            print("[*] stream.js already completed; follower.js id=2 not started.", flush=True)
+        return None, None
+
     if BOOST_SHOW_LOGS:
         print(f"[*] Starting follower.js id=2 in the background...", flush=True)
 
-    return asyncio.create_task(
+    task = asyncio.create_task(
         run_module("follower.js", silent=not BOOST_SHOW_LOGS, args=["id=2"],
                    holder=holder, prefix=BOOST_LOG_PREFIX)
     )
+
+    # When stream.js completes, main.py exits follower.js id=2 right away
+    stopper = None
+    if stream_task is not None:
+        stopper = asyncio.create_task(stop_when_done(stream_task, task, holder, BOOST_SHOW_LOGS))
+    return task, stopper
 
 async def run_pipeline():
     failed = []
     stream_task = None
     boost_task = None
+    boost_stopper = None
     boost_holder = {}
     boost_started = False
     
@@ -165,7 +202,7 @@ async def run_pipeline():
         # so the booster can start right away
         if BOOST_ENABLED and not boost_started and not follower_step_enabled:
             boost_started = True
-            boost_task = start_boost(boost_holder)
+            boost_task, boost_stopper = start_boost(stream_task, boost_holder)
 
         # Run the main pipeline module (blocks until finished)
         code = await run_module(name, silent=pipeline_silent)
@@ -175,7 +212,7 @@ async def run_pipeline():
         # Normal follower.js has completed: now it is safe to start follower.js id=2
         if name == "follower.js" and BOOST_ENABLED and not boost_started:
             boost_started = True
-            boost_task = start_boost(boost_holder)
+            boost_task, boost_stopper = start_boost(stream_task, boost_holder)
 
     # Wait for the background stream.js to finish before exiting entirely
     if stream_task:
@@ -195,15 +232,12 @@ async def run_pipeline():
             if not pipeline_silent or STREAM_SHOW_LOGS:
                 print(f"[!] Error in background stream.js: {e}", flush=True)
 
-    # stream.js finishing does not stop the booster: keep waiting until follower.js id=2 stops by itself
+    # stream.js is done (or was never started): make sure the follower booster is stopped
     if boost_task:
-        if not boost_task.done() and (BOOST_SHOW_LOGS or not pipeline_silent):
-            print(f"\n[*] Waiting for follower.js id=2 to stop by itself...", flush=True)
-        try:
-            await boost_task
-        except Exception as e:
-            if BOOST_SHOW_LOGS or not pipeline_silent:
-                print(f"[!] Error in background follower.js id=2: {e}", flush=True)
+        if boost_stopper:
+            await boost_stopper
+        else:
+            await stop_background(boost_task, boost_holder, "follower.js id=2", BOOST_SHOW_LOGS)
 
     if failed and not pipeline_silent:
         print(f"[!] Pipeline finished with errors in: {', '.join(failed)}", flush=True)
