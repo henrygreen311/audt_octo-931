@@ -94,6 +94,7 @@ const TARGET_ADDRESS = 'qringgreen@gmail.com';
 const CFG = {
   timezone: process.env.RESET_TIMEZONE || 'America/Los_Angeles',
   resetHour: Number(process.env.RESET_HOUR ?? 12),
+  dayTimezone: process.env.DAY_TIMEZONE || 'Africa/Lagos',
   dailyPerTrack: Number(process.env.DAILY_REPOSTS_PER_TRACK || 100),
   runsPerDay: 2,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
@@ -171,18 +172,24 @@ function addDays(ymd, n) {
 
 function buildContext(now) {
   let parts;
+  let dayParts;
   try {
     parts = new Intl.DateTimeFormat('en-US', {
       timeZone: CFG.timezone, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long',
     }).formatToParts(new Date(now.getTime() - CFG.resetHour * 3600000));
+    dayParts = new Intl.DateTimeFormat('en-US', {
+      timeZone: CFG.dayTimezone, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long',
+    }).formatToParts(now);
   } catch (e) {
-    throw new Error(`Invalid RESET_TIMEZONE "${CFG.timezone}": ${e.message}`);
+    throw new Error(`Invalid timezone (RESET_TIMEZONE "${CFG.timezone}", DAY_TIMEZONE "${CFG.dayTimezone}"): ${e.message}`);
   }
   const p = {};
   for (const x of parts) p[x.type] = x.value;
-  const today = `${p.year}-${p.month}-${p.day}`;
+  const d = {};
+  for (const x of dayParts) d[x.type] = x.value;
+  const weekDay = `${p.year}-${p.month}-${p.day}`;
   const dayIndex = ['Friday', 'Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday'].indexOf(p.weekday);
-  return { today, dayName: p.weekday, dayIndex, weekStart: addDays(today, -dayIndex), tz: CFG.timezone };
+  return { today: `${d.year}-${d.month}-${d.day}`, dayName: d.weekday, dayIndex, weekStart: addDays(weekDay, -dayIndex), tz: CFG.timezone };
 }
 
 class LockLostError extends Error {}
@@ -250,7 +257,7 @@ function sameWeek(raw, weekStart) {
   if (!isObj(raw)) return false;
   if (raw.week_start === weekStart) return true;
   if (!Array.isArray(raw.runs) || !raw.runs.length) return false;
-  const end = addDays(weekStart, 7);
+  const end = addDays(weekStart, 8);
   return raw.runs.every(r => r.date >= weekStart && r.date < end);
 }
 
@@ -332,7 +339,7 @@ async function flushPending(sb, ctx) {
   if (!PENDING.length) return;
   const keep = [];
   for (const p of PENDING) {
-    if (!(p.date >= ctx.weekStart && p.date < addDays(ctx.weekStart, 7))) continue;
+    if (!(p.date >= ctx.weekStart && p.date < addDays(ctx.weekStart, 8))) continue;
     try { await recordRepost(sb, ctx.weekStart, p.address, p); } catch (_) { keep.push(p); }
   }
   log(`[*] Recovered ${PENDING.length - keep.length}/${PENDING.length} unsaved reposts.`);
