@@ -32,7 +32,7 @@ BOOST_LOG_PREFIX = "[boost] "
 PIPELINE_SHOW_LOGS = False
 
 PIPELINE = [
-    ("upload_track.js", True),
+    ("upload_track.js", False),
     ("follower.js", True),
     ("favorite.js", True),
     ("repost.js", True),
