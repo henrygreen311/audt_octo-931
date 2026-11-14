@@ -34,9 +34,9 @@ PIPELINE_SHOW_LOGS = False
 PIPELINE = [
     ("upload_track.js", True),
     ("follower.js", True),
-    ("favorite.js", False),
-    ("repost.js", False),
-    ("comment.js", False),
+    ("favorite.js", True),
+    ("repost.js", True),
+    ("comment.js", True),
 ]
 
 async def stream_reader(stream, is_stderr=False, silent=False, prefix=""):

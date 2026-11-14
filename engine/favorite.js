@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 'use strict';
 
+const DAILY_FAVORITES_PER_TRACK = 30;
+const WEEKLY_FAVORITES_PER_TRACK = 200;
+const RUNS_PER_DAY = 2;
+
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -95,8 +99,9 @@ const CFG = {
   timezone: process.env.RESET_TIMEZONE || 'America/Los_Angeles',
   resetHour: Number(process.env.RESET_HOUR ?? 12),
   dayTimezone: process.env.DAY_TIMEZONE || 'Africa/Lagos',
-  dailyPerTrack: Number(process.env.DAILY_FAVORITES_PER_TRACK || 100),
-  runsPerDay: 2,
+  dailyPerTrack: Number(process.env.DAILY_FAVORITES_PER_TRACK || DAILY_FAVORITES_PER_TRACK),
+  weeklyPerTrack: Number(process.env.WEEKLY_FAVORITES_PER_TRACK || WEEKLY_FAVORITES_PER_TRACK),
+  runsPerDay: RUNS_PER_DAY,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
@@ -247,7 +252,7 @@ function collectTracks(upTracks) {
     if (seen.has(id)) continue;
     seen.set(id, {
       id, key: id, address: d.address || null, handle: typeof d.handle === 'string' ? d.handle : null,
-      date: latest, cap: CFG.dailyPerTrack,
+      date: latest, cap: CFG.dailyPerTrack, weeklyCap: CFG.weeklyPerTrack,
     });
   }
   return [...seen.values()];
@@ -441,11 +446,14 @@ async function verifyFavorite(sdk, userId, trackId) {
 
 function tracksBelowCap(rows, published, ctx) {
   const today = countTracks(rows, ctx);
-  return published.filter(p => (today.get(p.key) || 0) < p.cap);
+  const week = countWeek(rows, ctx);
+  return published.filter(p => (today.get(p.key) || 0) < p.cap && (week.get(p.key) || 0) < p.weeklyCap);
 }
 
-function allDoneMsg(n) {
-  return `[*] All ${n} tracks reached their daily favorite limit. Exiting.`;
+function allDoneMsg(n, rows, tracks, ctx) {
+  const week = countWeek(rows, ctx);
+  const weekly = tracks.every(t => (week.get(t.key) || 0) >= t.weeklyCap);
+  return `[*] All ${n} tracks reached their ${weekly ? 'weekly' : 'daily'} favorite limit. Exiting.`;
 }
 
 function dayState(coord, today) {
@@ -578,6 +586,22 @@ function countTracks(rows, ctx, runNumber) {
   return counts;
 }
 
+function countWeek(rows, ctx) {
+  const counts = new Map();
+  for (const r of rows) {
+    const f = r.favorite;
+    if (!isObj(f) || !sameWeek(f, ctx.weekStart) || !Array.isArray(f.runs)) continue;
+    for (const x of f.runs) {
+      for (const t of x.tracks || []) {
+        if (t.status !== 'success') continue;
+        const k = String(t.track_id);
+        counts.set(k, (counts.get(k) || 0) + 1);
+      }
+    }
+  }
+  return counts;
+}
+
 async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   const accounts = rows.map(r => ({
     address: r.address, handle: typeof r.handle === 'string' ? r.handle.trim().replace(/^@/, '') : null,
@@ -596,8 +620,9 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
 
   const todayDone = countTracks(rows, ctx);
   const runDone = countTracks(rows, ctx, runNumber);
+  const weekDone = countWeek(rows, ctx);
   const need = new Map(targets.map(t => {
-    const left = Math.max(0, t.cap - (todayDone.get(t.key) || 0));
+    const left = Math.max(0, Math.min(t.cap - (todayDone.get(t.key) || 0), t.weeklyCap - (weekDone.get(t.key) || 0)));
     const attempts = Math.max(0, attemptsPerRun(t.cap) - (runDone.get(t.key) || 0));
     return [t.key, { attempts: left ? attempts : 0, maxOk: left }];
   }));
@@ -611,7 +636,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   }
   if (!totalNeed) {
     if (!tracksBelowCap(rows, targets, ctx).length) {
-      log(allDoneMsg(targets.length));
+      log(allDoneMsg(targets.length, rows, targets, ctx));
       return { status: 'ALREADY_COMPLETED' };
     }
     await updateFavorite(sb, TARGET_ADDRESS, ctx.weekStart, h => {
@@ -624,7 +649,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     log(`[*] Run ${runNumber}: nothing left to attempt in this run.`);
     return { status: 'COMPLETED' };
   }
-  const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
+  const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap || (weekDone.get(t.key) || 0) >= t.weeklyCap).length;
   log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} favorites.`);
 
   if (!batch) {
@@ -649,10 +674,11 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     const day = (todayDone.get(t.key) || 0) + got;
+    const week = (weekDone.get(t.key) || 0) + got;
     if (started < n.attempts && got < n.maxOk && !run.stop) {
-      log(`[!] track ${t.id} | ${day}/${t.cap} today (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
+      log(`[!] track ${t.id} | ${day}/${t.cap} today, ${week}/${t.weeklyCap} week (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
     } else {
-      log(`[*] track ${t.id} | ${day}/${t.cap} today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
+      log(`[*] track ${t.id} | ${day}/${t.cap} today, ${week}/${t.weeklyCap} week${day >= t.cap || week >= t.weeklyCap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
     }
     if (run.stop) incomplete = true;
   }
@@ -693,7 +719,7 @@ async function runFavorite({ now = new Date() } = {}) {
     log('[*] New week: history reset.');
   }
   if (!tracksBelowCap(rows, published, ctx).length) {
-    log(allDoneMsg(published.length));
+    log(allDoneMsg(published.length, rows, published, ctx));
     return { status: 'ALREADY_COMPLETED' };
   }
   if (!dayState(normalizeFavorite(coordRaw, ctx.weekStart), ctx.today)) {
@@ -712,7 +738,7 @@ async function runFavorite({ now = new Date() } = {}) {
     rows = await fetchRows(sb);
     const coord = normalizeFavorite(rows.find(r => r.address === TARGET_ADDRESS).favorite, ctx.weekStart);
     if (!tracksBelowCap(rows, published, ctx).length) {
-      log(allDoneMsg(published.length));
+      log(allDoneMsg(published.length, rows, published, ctx));
       return { status: 'ALREADY_COMPLETED' };
     }
     const state = dayState(coord, ctx.today);
