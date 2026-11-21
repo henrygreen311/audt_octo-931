@@ -3,6 +3,85 @@ const fs = require('fs');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 
+// --- Proxy Configuration ---
+const DEFAULT_PROXIES = [
+  'https://audius-v2.qringgreen.workers.dev',
+  'https://audius-v2.qring99.workers.dev',
+  'https://audius.henrygreen311.workers.dev',
+  'https://audius-v2.henrygreen311.workers.dev',
+  'https://audius.qring99.workers.dev',
+  'https://audius.qringgreen.workers.dev',
+];
+const PROXY_URLS = [...new Set(
+  (process.env.AUDIUS_PROXY_URLS || DEFAULT_PROXIES.join(','))
+    .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean)
+)];
+const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
+
+// --- Intercept Fetch for Proxies ---
+{
+  const realFetch = globalThis.fetch;
+  const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+  const RETRY_STATUS = new Set([502, 503, 504]);
+  const downUntil = new Map();
+  const warned = new Set();
+  const ATTEMPTS = Number(process.env.PROXY_ATTEMPTS || 6);
+  const STATUS_ATTEMPTS = Number(process.env.PROXY_STATUS_ATTEMPTS || 3);
+  const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+
+  const pick = avoid => {
+    const now = Date.now();
+    const up = PROXY_URLS.filter(u => (downUntil.get(u) || 0) <= now);
+    let pool = up.length ? up : PROXY_URLS;
+    if (avoid && pool.length > 1) pool = pool.filter(u => u !== avoid);
+    return pool[Math.floor(Math.random() * pool.length)];
+  };
+
+  console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
+  globalThis.fetch = async (input, init) => {
+    const isReq = typeof input === 'object' && input !== null && 'url' in input;
+    let url;
+    try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
+    
+    // Only proxy Audius API calls
+    if (url.hostname !== 'api.audius.co') return realFetch(input, init);
+
+    const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
+    if (PROXY_KEY) headers.set('x-proxy-key', PROXY_KEY);
+    let lastErr;
+    let lastProxy = null;
+    let statusTries = 0;
+
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+      const proxy = pick(lastProxy);
+      lastProxy = proxy;
+
+      const target = proxy + url.pathname + url.search;
+      let res;
+      try {
+        res = isReq && !init
+          ? await realFetch(new Request(target, input.clone()), { headers })
+          : await realFetch(target, { ...init, headers });
+      } catch (e) {
+        const code = e && ((e.cause && e.cause.code) || e.code);
+        if (!CONNECT_ERRS.has(code)) throw e;
+        lastErr = e;
+        downUntil.set(proxy, Date.now() + 20000);
+        if (!warned.has(proxy)) { warned.add(proxy); console.log(`[!] Proxy ${new URL(proxy).host} unreachable; using another.`); }
+        await sleepMs(300 * attempt);
+        continue;
+      }
+      if (RETRY_STATUS.has(res.status) && ++statusTries < STATUS_ATTEMPTS) {
+        try { if (res.body) await res.body.cancel(); } catch (_) {}
+        await sleepMs(500 * statusTries);
+        continue;
+      }
+      return res;
+    }
+    throw lastErr;
+  };
+}
+
 // --- Safely resolve SDK ---
 let sdkPkg;
 try {
@@ -34,37 +113,52 @@ for (const level of ['log', 'info', 'debug', 'warn']) {
   };
 }
 
-// --- Guard against SDK background tasks (e.g. storage-node health checks)
-// crashing the whole process. These run outside our own await chains, so
-// per-account try/catch can't catch them; without this, a single flaky
-// network timeout inside the SDK kills an otherwise-healthy 300+ account run.
 process.on('unhandledRejection', (reason) => {
-  const msg = reason && reason.message ? reason.message : String(reason);
-  log(`[!] Unhandled rejection (likely SDK background task): ${msg}`);
+  log(`[!] Background error: ${describeError(reason)}`);
 });
 process.on('uncaughtException', (err) => {
-  log(`[!] Uncaught exception (likely SDK background task): ${err.message || err}`);
+  log(`[!] Background error: ${describeError(err)}`);
 });
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DB_FILE = path.join(ROOT_DIR, 'db.txt');
-const MAX_RETRIES = 5;           // retries per API call on 429 / 5xx / network errors
-const PENDING_MODE = process.argv.includes('--pending'); // node balance_checker.js --pending
-const PENDING_CONCURRENCY = 5;   // accounts checked at the same time in --pending mode
-const AMOUNT_DECIMALS = 0;       // set to 8 if reward amounts come back in raw units (e.g. 100000000)
+const MAX_RETRIES = 5;
+const PENDING_MODE = process.argv.includes('--pending');
+const CLAIM_MODE = process.argv.includes('--claim');
+const DEBUG = process.argv.includes('--debug') || process.env.DEBUG === '1';
+const VERBOSE = process.argv.includes('--verbose') || process.env.VERBOSE === '1';
+const ONLY_ADDRESS = (() => {
+  const m = process.argv.find(a => a.startsWith('--address='));
+  return m ? m.slice('--address='.length) : null;
+})();
+
+const PENDING_CONCURRENCY = Number(process.env.PENDING_CONCURRENCY || 5);
 const API_BASE = process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1';
-const BASE_DELAY_MS = 1000;      // backoff: 1s, 2s, 4s, 8s, 16s (+ jitter)
+const BASE_DELAY_MS = 1000;
+const PAGE_SIZE = Number(process.env.UNDISBURSED_PAGE_SIZE || 100);
+const MAX_PAGES = Number(process.env.UNDISBURSED_MAX_PAGES || 20);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// The SDK's message ("Response returned an error code") hides the HTTP status.
 function getStatus(e) {
   return e?.status ?? e?.response?.status ?? e?.cause?.status ?? null;
 }
 
-// Retry an SDK call on rate limits (429), server errors (5xx) and network
-// failures. Honors a Retry-After header if the error exposes one. Other
-// errors (e.g. 404) are thrown immediately.
+const STATUS_NAMES = {
+  400: 'bad request', 401: 'unauthorized', 403: 'forbidden', 404: 'not found', 408: 'request timeout',
+  409: 'conflict', 422: 'unprocessable', 429: 'rate limited',
+};
+
+// Short, human-readable error: the HTTP status code and its name, never the API response body.
+function describeError(e) {
+  const status = getStatus(e);
+  if (status) return `HTTP ${status} ${STATUS_NAMES[status] || (status >= 500 ? 'server error' : status >= 400 ? 'client error' : 'unexpected status')}`;
+  const msg = String((e && e.message) || e).replace(/\s+/g, ' ');
+  if (/abort|timeout|timed out/i.test(msg)) return 'timed out';
+  if (/fetch failed|network|ECONN|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|socket/i.test(msg)) return 'network error';
+  return msg.slice(0, 40);
+}
+
 async function withRetry(fn) {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -83,7 +177,6 @@ async function withRetry(fn) {
   }
 }
 
-// --- Pending rewards (--pending) ---
 const DAY_MS = 86400000;
 
 function toMs(v) {
@@ -94,7 +187,23 @@ function toMs(v) {
   return Number.isFinite(t) ? t : null;
 }
 
-const amountOf = (raw) => { const n = Number(raw) / Math.pow(10, AMOUNT_DECIMALS); return Number.isFinite(n) ? n : 0; };
+function pickField(obj, ...names) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  for (const name of names) {
+    if (obj[name] !== undefined && obj[name] !== null) return obj[name];
+  }
+  return undefined;
+}
+
+const AMOUNT_DECIMALS = Number(process.env.AMOUNT_DECIMALS || 0);
+
+function amountOf(raw) {
+  if (raw === null || raw === undefined || raw === '') return 0;
+  const n = typeof raw === 'string' ? parseFloat(raw) : Number(raw);
+  if (!Number.isFinite(n)) return 0;
+  return n / Math.pow(10, AMOUNT_DECIMALS);
+}
+
 const plainAmount = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2));
 const fmtAmount = (n) => `${plainAmount(n)} $AUDIO`;
 
@@ -105,56 +214,179 @@ function fmtLeft(ms) {
   return d ? (h ? `${d}d ${h}h` : `${d}d`) : `${h}h`;
 }
 
-// Completed but unpaid rewards: "pending" while the cooldown (completed_at + cooldown_days) has not
-// passed, "ready to claim" afterwards (or when there is no cooldown).
-async function fetchUndisbursed(appData, userId) {
-  const qs = new URLSearchParams({ limit: '100', api_key: appData.api_key, app_name: 'balance_checker' });
+async function fetchUndisbursedPage(appData, userId, offset, limit) {
+  const qs = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+    api_key: appData.api_key,
+    app_name: 'balance_checker',
+  });
   const headers = { Accept: 'application/json' };
   if (appData.bearer_token) headers.Authorization = `Bearer ${appData.bearer_token}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
-    const res = await fetch(`${API_BASE}/challenges/undisbursed/${userId}?${qs}`, { headers, signal: controller.signal });
+    const res = await fetch(`${API_BASE}/challenges/undisbursed/${userId}?${qs}`, {
+      headers,
+      signal: controller.signal,
+    });
     if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
     const json = await res.json();
-    return Array.isArray(json && json.data) ? json.data : [];
+    if (Array.isArray(json)) return json;
+    if (json && Array.isArray(json.data)) return json.data;
+    if (json && Array.isArray(json.challenges)) return json.challenges;
+    if (json && json.data && Array.isArray(json.data.challenges)) return json.data.challenges;
+    if (json && json.data && Array.isArray(json.data.items)) return json.data.items;
+    if (json && json.data && Array.isArray(json.data.results)) return json.data.results;
+    if (DEBUG) log(`  [debug] unrecognized response shape for user ${userId}: ${JSON.stringify(json).slice(0, 200)}`);
+    return [];
   } finally {
     clearTimeout(timer);
   }
 }
 
+async function fetchUndisbursed(appData, userId) {
+  const all = [];
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const offset = page * PAGE_SIZE;
+    let items;
+    try {
+      items = await withRetry(() => fetchUndisbursedPage(appData, userId, offset, PAGE_SIZE));
+    } catch (e) {
+      if (page === 0) throw e;
+      if (DEBUG) log(`  [debug] user ${userId} page ${page + 1} (offset ${offset}) failed: ${describeError(e)}`);
+      break;
+    }
+    if (DEBUG) log(`  [debug] user ${userId} page ${page + 1} (offset ${offset}): ${items.length} record(s)`);
+    all.push(...items);
+    if (items.length < PAGE_SIZE) break;
+  }
+  return all;
+}
+
 function classifyRewards(list, now) {
   const out = { ready: [], pending: [] };
   for (const r of list) {
-    const amount = amountOf(r.amount);
-    const done = toMs(r.completed_at) ?? toMs(r.created_at);
-    const cooldown = Number(r.cooldown_days) || 0;
+    let amount = amountOf(pickField(r, 'amount', 'reward_amount', 'rewardAmount'));
+    const multiplier = Number(pickField(r, 'multiplier', 'reward_multiplier', 'payout_multiplier') || 1);
+    if (multiplier > 1) amount *= multiplier;
+    const total = pickField(r, 'total_amount', 'totalAmount');
+    if (total !== undefined) {
+      const t = amountOf(total);
+      if (t > 0) amount = t;
+    }
+    const done = toMs(pickField(r, 'completed_at', 'completedAt', 'completed_date'))
+      ?? toMs(pickField(r, 'created_at', 'createdAt', 'date_created'));
+    const cooldown = Number(pickField(r, 'cooldown_days', 'cooldownDays', 'cooldown')) || 0;
     const readyAt = done === null ? null : done + cooldown * DAY_MS;
-    if (readyAt !== null && readyAt > now) out.pending.push({ amount, left: readyAt - now });
-    else out.ready.push({ amount });
+    if (readyAt !== null && readyAt > now) {
+      out.pending.push({ amount, left: readyAt - now, raw: r });
+    } else {
+      out.ready.push({ amount, raw: r });
+    }
   }
   out.pending.sort((a, b) => a.left - b.left);
   return out;
 }
 
+async function claimReward(appData, userId, challengeId, specifier) {
+  const body = { userId, challengeId, specifier };
+
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+  if (appData.bearer_token) headers.Authorization = `Bearer ${appData.bearer_token}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch(`${API_BASE}/rewards/claim`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}`);
+      err.status = res.status;
+      if (DEBUG) err.responseText = text.replace(/\s+/g, ' ').slice(0, 150);
+      throw err;
+    }
+    return json;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function claimAllReady(acc, readyList) {
+  const results = { claimed: 0, failed: 0, reasons: new Map() };
+  const fail = (why) => { results.failed++; results.reasons.set(why, (results.reasons.get(why) || 0) + 1); };
+
+  for (const item of readyList) {
+    const r = item.raw;
+    const challengeId = pickField(r, 'challenge_id', 'challengeId', 'id') || null;
+    const specifier = pickField(r, 'specifier', 'spec') || null;
+
+    if (!challengeId || !specifier) {
+      fail('missing challenge data');
+      if (VERBOSE) log(`  [claim] ${acc.address} ✗ missing challenge data`);
+      continue;
+    }
+
+    try {
+      await withRetry(() => claimReward(acc.app_data, acc.user_id, challengeId, specifier));
+      results.claimed++;
+      if (VERBOSE) log(`  [claim] ${acc.address} ✓ ${challengeId} ${fmtAmount(item.amount)}`);
+    } catch (e) {
+      const why = describeError(e);
+      fail(why);
+      if (VERBOSE) log(`  [claim] ${acc.address} ✗ ${challengeId}: ${why}`);
+      if (DEBUG && e.responseText) log(`          response: ${e.responseText}`);
+    }
+  }
+  return results;
+}
+
 async function checkPending(accounts) {
   const now = Date.now();
-  const queue = accounts.filter(a => a.user_id && a.app_data && a.app_data.api_key);
-  const skipped = accounts.length - queue.length;
+  const filtered = ONLY_ADDRESS ? accounts.filter(a => a.address === ONLY_ADDRESS) : accounts;
+  const queue = filtered.filter(a => a.user_id && a.app_data && a.app_data.api_key);
+  const skipped = filtered.length - queue.length;
   const results = [];
   const reasons = new Map();
   let errors = 0;
+  let totalClaimed = 0;
+  let totalClaimFailed = 0;
+  const claimReasons = new Map();
+
+  if (ONLY_ADDRESS) log(`[*] Filtered to ${queue.length} account(s) matching --address=${ONLY_ADDRESS}.`);
+  if (CLAIM_MODE) log(`[*] Claim mode active: will attempt to claim ready rewards.`);
 
   const worker = async () => {
     while (queue.length) {
       const acc = queue.shift();
       try {
         const list = await withRetry(() => fetchUndisbursed(acc.app_data, acc.user_id));
-        results.push({ address: acc.address, ...classifyRewards(list, now) });
+        const classified = classifyRewards(list, now);
+        const result = { address: acc.address, records: list, ...classified };
+
+        if (CLAIM_MODE && result.ready.length) {
+          const claim = await claimAllReady(acc, result.ready);
+          result.claim = claim;
+          totalClaimed += claim.claimed;
+          totalClaimFailed += claim.failed;
+          for (const [why, n] of claim.reasons) claimReasons.set(why, (claimReasons.get(why) || 0) + n);
+        }
+
+        results.push(result);
       } catch (e) {
         errors++;
-        const status = getStatus(e);
-        const why = status ? `HTTP ${status}` : String(e.message || e).slice(0, 40);
+        const why = describeError(e);
         reasons.set(why, (reasons.get(why) || 0) + 1);
       }
     }
@@ -167,37 +399,53 @@ async function checkPending(accounts) {
     (a.pending[0] ? a.pending[0].left : Infinity) - (b.pending[0] ? b.pending[0].left : Infinity));
 
   for (const x of withRewards) {
+    if (!x.ready.length && !(CLAIM_MODE && x.claim && x.claim.failed)) {
+      continue;
+    }
+
     const parts = [];
-    if (x.ready.length) parts.push(`ready to claim ${fmtAmount(sum(x.ready))}`);
-    if (x.pending.length === 1) parts.push(`pending ${fmtAmount(x.pending[0].amount)}, ${fmtLeft(x.pending[0].left)} left`);
-    else if (x.pending.length) parts.push(`pending ${fmtAmount(sum(x.pending))} (${x.pending.map(p => `${plainAmount(p.amount)} in ${fmtLeft(p.left)}`).join(', ')})`);
+    if (x.ready.length) {
+      parts.push(`ready to claim ${fmtAmount(sum(x.ready))} (${x.ready.length} reward${x.ready.length > 1 ? 's' : ''})`);
+    }
+    if (x.pending.length === 1) {
+      parts.push(`pending ${fmtAmount(x.pending[0].amount)}, ${fmtLeft(x.pending[0].left)} left`);
+    } else if (x.pending.length) {
+      parts.push(`pending ${fmtAmount(sum(x.pending))} (${x.pending.map(p => `${plainAmount(p.amount)} in ${fmtLeft(p.left)}`).join(', ')})`);
+    }
+    if (CLAIM_MODE && x.claim) {
+      const c = x.claim;
+      if (c.claimed) parts.push(`claimed ${c.claimed}`);
+      if (c.failed) parts.push(`${c.failed} failed (${[...c.reasons.keys()].join(', ')})`);
+    }
     log(`[${x.address}] ${parts.join(' | ')}`);
   }
 
   const allReady = results.flatMap(x => x.ready);
   const allPending = results.flatMap(x => x.pending);
   const summary = [
-    `ready to claim ${fmtAmount(sum(allReady))} in ${results.filter(x => x.ready.length).length} accounts`,
-    `pending ${fmtAmount(sum(allPending))} in ${results.filter(x => x.pending.length).length} accounts`,
+    `ready to claim ${fmtAmount(sum(allReady))} in ${results.filter(x => x.ready.length).length} accounts (${allReady.length} rewards)`,
+    `pending ${fmtAmount(sum(allPending))} in ${results.filter(x => x.pending.length).length} accounts (${allPending.length} rewards)`,
   ];
   if (allPending.length) summary.push(`next unlock in ${fmtLeft(allPending.reduce((m, p) => Math.min(m, p.left), Infinity))}`);
   const none = results.length - withRewards.length;
   if (none) summary.push(`${none} with nothing to claim`);
   if (errors) summary.push(`${errors} errors (${[...reasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
   if (skipped) summary.push(`${skipped} without credentials`);
+
+  if (CLAIM_MODE) {
+    summary.push(`claimed ${totalClaimed}, failed ${totalClaimFailed}${totalClaimFailed ? ` (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})` : ''}`);
+  }
+
   log(`[*] Pending rewards: ${summary.join(' | ')}.`);
 }
 
-// --- Check Single Account ---
 async function checkAccount(supabase, account) {
   const address = account.address;
   const userId = account.user_id;
   const oldBalance = parseFloat(account.balance || 0);
   const appData = account.app_data;
 
-  if (!userId || !appData || !appData.api_key) {
-    return; // Skip accounts without credentials
-  }
+  if (!userId || !appData || !appData.api_key) return;
 
   try {
     const sdk = sdkFactory({
@@ -206,19 +454,18 @@ async function checkAccount(supabase, account) {
       bearerToken: appData.bearer_token,
     });
 
-    // Profile balance fields (REST: total_audio_balance, balance,
-    // total_balance, waudio_balance -> SDK camelCase equivalents)
-    let totalAudioBalance = null; // total_audio_balance (integer, whole AUDIO)
-    let ethBalance = null;        // balance (string, wei-ish units)
-    let totalBalance = null;      // total_balance (string)
-    let waudioBalance = null;     // waudio_balance (string)
+    let totalAudioBalance = null;
+    let ethBalance = null;
+    let totalBalance = null;
+    let waudioBalance = null;
 
     let coinBalance = 0.0;
     let coinBalanceUsd = 0.0;
     let historyCount = 0;
     let historyFailed = false;
+    const issues = [];
+    let historyIssue = '';
 
-    // 1. Fetch Profile
     try {
       const userRes = await withRetry(() => sdk.users.getUser({ id: userId }));
       const user = userRes?.data;
@@ -229,10 +476,9 @@ async function checkAccount(supabase, account) {
         waudioBalance = user.waudioBalance ?? null;
       }
     } catch (e) {
-      log(`[${address}] Profile fetch failed (status=${getStatus(e) ?? 'unknown'}): ${e.message || e}`);
+      issues.push(`profile fetch failed: ${describeError(e)}`);
     }
 
-    // 2. Fetch Coins (filter strictly for $AUDIO, sum across all accounts)
     try {
       const coinsRes = await withRetry(() => sdk.users.getUserCoins({ id: userId }));
       const coins = coinsRes?.data;
@@ -242,7 +488,7 @@ async function checkAccount(supabase, account) {
           const decimals = audioCoin.decimals ?? 8;
           const accountsArr = Array.isArray(audioCoin.accounts) && audioCoin.accounts.length > 0
             ? audioCoin.accounts
-            : [audioCoin]; // fall back to top-level balance if no accounts[]
+            : [audioCoin];
 
           let rawTotal = 0;
           let usdTotal = 0;
@@ -255,10 +501,9 @@ async function checkAccount(supabase, account) {
         }
       }
     } catch (e) {
-      log(`[${address}] Coin fetch failed (status=${getStatus(e) ?? 'unknown'}): ${e.message || e}`);
+      issues.push(`coin fetch failed: ${describeError(e)}`);
     }
 
-    // 3. Fetch Balance History
     try {
       const historyRes = await withRetry(() => sdk.users.getUserBalanceHistory({ id: userId, granularity: 'daily' }));
       const data = historyRes?.data;
@@ -267,18 +512,14 @@ async function checkAccount(supabase, account) {
       }
     } catch (e) {
       const status = getStatus(e);
-
       if (status === 404) {
-        // No history exists for this user (common for empty/never-funded
-        // accounts) — this is a legitimate zero, not a failure.
         historyCount = 0;
       } else {
         historyFailed = true;
-        log(`[${address}] History fetch failed (status=${status ?? 'unknown'}): ${e.message || e}`);
+        historyIssue = describeError(e);
       }
     }
 
-    // 4. Decide what to log
     const logs = [];
     if (totalAudioBalance !== null) logs.push(`Total Audio: ${totalAudioBalance}`);
     if (ethBalance !== null) logs.push(`Balance: ${ethBalance}`);
@@ -286,12 +527,10 @@ async function checkAccount(supabase, account) {
     if (waudioBalance !== null) logs.push(`WAudio: ${waudioBalance}`);
     if (coinBalance > 0) logs.push(`$AUDIO Coin: ${coinBalance} ($${coinBalanceUsd})`);
     if (historyCount > 0) logs.push(`History: ${historyCount} items`);
-    else if (historyFailed) logs.push(`History: fetch failed (not confirmed empty)`);
+    else if (historyFailed) logs.push(`History: fetch failed, ${historyIssue}`);
 
-    // 5. Update DB if balance changed — table only has a single 'balance'
-    // column, so pick the best available source and write only that.
-    // Preference: total_audio_balance (profile) -> $AUDIO coin balance
-    // (fallback, e.g. if the profile call failed or the field was null).
+    logs.push(...issues);
+
     const updates = {};
     const resolvedBalance = totalAudioBalance !== null ? totalAudioBalance : (coinBalance > 0 ? coinBalance : null);
 
@@ -301,30 +540,20 @@ async function checkAccount(supabase, account) {
 
     if (Object.keys(updates).length > 0) {
       try {
-        const { error } = await supabase
-          .from('audius')
-          .update(updates)
-          .eq('address', address);
-
-        if (error) {
-          logs.push(`DB update failed: ${error.message}`);
-        }
+        const { error } = await supabase.from('audius').update(updates).eq('address', address);
+        if (error) logs.push('DB update failed');
       } catch (e) {
-        logs.push(`DB update failed: ${e.message}`);
+        logs.push('DB update failed');
       }
     }
 
-    // 6. Output exactly 1 line if anything noteworthy happened
-    if (logs.length > 0) {
-      log(`[${address}] ${logs.join(' | ')}`);
-    }
+    if (logs.length > 0) log(`[${address}] ${logs.join(' | ')}`);
 
   } catch (err) {
-    log(`[${address}] Error: ${err.message || err}`);
+    log(`[${address}] failed: ${describeError(err)}`);
   }
 }
 
-// --- Main ---
 async function main() {
   if (!fs.existsSync(DB_FILE)) {
     console.error(`[!] DB file not found.`);
@@ -349,7 +578,7 @@ async function main() {
     .not('user_id', 'is', null);
 
   if (error) {
-    console.error(`[!] Failed to fetch accounts:`, error);
+    console.error(`[!] Failed to fetch accounts: ${error.message || error}`);
     process.exit(1);
   }
 
@@ -358,23 +587,22 @@ async function main() {
     return;
   }
 
-  if (PENDING_MODE) {
-    log(`[*] Checking pending rewards for ${accounts.length} accounts...`);
+  if (PENDING_MODE || CLAIM_MODE) {
+    const modeLabel = CLAIM_MODE ? 'claim' : 'pending';
+    log(`[*] Checking ${modeLabel} rewards for ${accounts.length} accounts (page size ${PAGE_SIZE})...`);
     await checkPending(accounts);
-    log(`[*] Pending reward check complete.`);
+    log(`[*] ${modeLabel.charAt(0).toUpperCase() + modeLabel.slice(1)} check complete.`);
     return;
   }
 
   log(`[*] Checking ${accounts.length} accounts one at a time...`);
-
   for (const acc of accounts) {
     await checkAccount(supabase, acc);
   }
-
   log(`[*] Balance check complete.`);
 }
 
 main().catch(err => {
-  console.error(`[!] Fatal:`, err);
+  console.error(`[!] Fatal: ${describeError(err)}`);
   process.exit(1);
 });
