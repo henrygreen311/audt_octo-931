@@ -9,9 +9,9 @@ const DEFAULT_TRENDING_MAX = 20;
 const DEFAULT_FEED_LIMIT = 30;
 const DEFAULT_MAX_TRACKS_PER_RUN = 5;
 const DEFAULT_FIRST_RUN_TRACKS = 10;
-const TARGET_INTERACTIONS = 20;
+const TARGET_INTERACTIONS = 10; // accounts that fav + repost each track (was 20)
 const FOCUS_DEFAULT_TARGET = 200;
-const DEFAULT_COMMENTS_PER_TRACK = 50;
+const DEFAULT_COMMENTS_PER_TRACK = 5;
 const FEED_TRACK_MAX_AGE_MS = 24 * 3600 * 1000;
 const STATE_VERSION_MAX_TRACKS = 1000;
 
@@ -169,6 +169,14 @@ const CFG = {
   commentsPerTrack: Number(process.env.COMMENTS_PER_TRACK || DEFAULT_COMMENTS_PER_TRACK),
   focusMaxTracks: Number(process.env.FOCUS_MAX_TRACKS || 0),
   streamDurationMs: Number(process.env.STREAM_DURATION_SECONDS || 30) * 1000, // used only for the stream= hint
+  // Explore (BPM) discovery — replaces the user feed in no-param mode
+  bpmRanges: (process.env.BPM_RANGES || '1-79,80-99,100-119,120-139,140-300')
+    .split(',').map(x => x.trim()).filter(Boolean)
+    .map(x => { const [a, b] = x.split('-').map(Number); return { min: a, max: b }; })
+    .filter(r => Number.isFinite(r.min) && Number.isFinite(r.max)),
+  exploreLimit: Number(process.env.EXPLORE_LIMIT || 25),                  // newest tracks pulled per BPM range
+  exploreMaxAgeMs: Number(process.env.EXPLORE_MAX_AGE_MINUTES || 5) * 60000,
+  exploreTrackCount: Number(process.env.EXPLORE_TRACK_COUNT || 5),        // tracks engaged per cycle
   _feedTarget: null,
 };
 
@@ -752,6 +760,47 @@ async function fetchFeed(userId, limit = CFG.feedLimit) {
   return audiusGet(path, 'feed', CFG.feedTimeoutMs);
 }
 
+// Explore "most recent" needs a genre; BPM filters work instead. Calls every BPM range
+// (newest first), merges them, then keeps the newest tracks that are younger than
+// exploreMaxAgeMs and have 0 favorites and 0 reposts.
+async function fetchExploreTracks() {
+  const ranges = CFG.bpmRanges;
+  if (!ranges.length) throw new Error('no valid BPM_RANGES configured');
+  const results = await Promise.allSettled(ranges.map(r =>
+    audiusGet(`/v1/tracks/search?sort_method=recent&bpm_min=${r.min}&bpm_max=${r.max}&limit=${CFG.exploreLimit}&app_name=tastemaker`,
+      `explore bpm ${r.min}-${r.max}`, CFG.feedTimeoutMs)));
+
+  const failed = results.filter(r => r.status === 'rejected');
+  if (failed.length === results.length) throw failed[0].reason;
+  if (failed.length) log(`[!] Explore: ${failed.length}/${results.length} BPM call(s) failed; using the rest.`);
+
+  const seen = new Map();
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    for (const t of (Array.isArray(r.value) ? r.value : [])) {
+      if (t && t.id && !seen.has(String(t.id))) seen.set(String(t.id), t);
+    }
+  }
+
+  const now = Date.now();
+  const fresh = [...seen.values()].filter(t => {
+    const created = Date.parse(t.created_at || '');
+    if (!Number.isFinite(created)) return false;
+    const age = now - created;
+    if (age < 0 || age > CFG.exploreMaxAgeMs) return false;
+    return Number(t.favorite_count || 0) === 0 && Number(t.repost_count || 0) === 0;
+  }).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+
+  log(`[*] Explore: ${ranges.length} BPM range(s) → ${seen.size} unique track(s) → ${fresh.length} under ${Math.round(CFG.exploreMaxAgeMs / 60000)}m old with no fav/repost.`);
+
+  return fresh.slice(0, CFG.exploreTrackCount).map(t => ({
+    id: String(t.id),
+    user: t.user || {},
+    title: t.title || '',
+    created_at: t.created_at || null,
+  }));
+}
+
 async function fetchUserByHandle(handle) {
   const data = await audiusGet(`/v1/users/handle/${encodeURIComponent(handle)}?app_name=tastemaker`, 'user lookup', CFG.callTimeoutMs);
   const user = Array.isArray(data) ? data[0] : data;
@@ -1113,18 +1162,16 @@ async function doFeedInteract(sb, ctx, state, pool, primary, focus) {
       }
     }
   } else {
-    let feedItems;
     try {
-      feedItems = await fetchFeed(primary.user_id, CFG.feedLimit);
+      tracks = await fetchExploreTracks();
     } catch (e) {
       const backoff = recordFeedFailure(state);
       await saveState(sb, ctx, state);
-      log(`[!] Feed fetch failed (attempt ${state.feed_fail_count}, retry in ${Math.round(backoff / 1000)}s): ${errMsg(e).slice(0, 60)}`);
+      log(`[!] Explore fetch failed (attempt ${state.feed_fail_count}, retry in ${Math.round(backoff / 1000)}s): ${errMsg(e).slice(0, 60)}`);
       return;
     }
     recordFeedSuccess(state);
-    tracks = extractTracks(feedItems);
-    trackSource = 'feed';
+    trackSource = 'explore (BPM, newest)';
   }
 
   if (!tracks.length) {
@@ -1395,7 +1442,7 @@ async function runTastemaker({ now = new Date(), focus = null } = {}) {
 
     if (!focus && shouldSkipFeed(state)) {
       const remain = Math.round((Date.parse(state.feed_retry_at) - Date.now()) / 1000);
-      log(`[*] Feed backoff active (${remain}s remaining, ${state.feed_fail_count} consecutive failures). Skipping feed.`);
+      log(`[*] Explore backoff active (${remain}s remaining, ${state.feed_fail_count} consecutive failures). Skipping explore.`);
     } else {
       await doFeedInteract(sb, ctx, state, pool, primary, focus);
     }
