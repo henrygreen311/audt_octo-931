@@ -166,9 +166,6 @@ const CFG = {
   targetRangeMax: Number(process.env.TARGET_RANGE_MAX || 27),
   // NEW: once a track hits this rank (or better), stop pushing it.
   top10MaxRank: Number(process.env.TOP10_MAX_RANK || 10),
-  // Two groups (by up_tracks order): first N = group A (push to top 5-10), the rest = group B (hold at 23-27)
-  groupASize: Number(process.env.GROUP_A_SIZE || 5),
-  groupATopMin: Number(process.env.GROUP_A_TOP_MIN || 5),
   previousWeekPerRun: Number(process.env.PREVIOUS_WEEK_STREAMS_PER_RUN || 100),
 };
 
@@ -308,8 +305,7 @@ function collectTracks(upTracks) {
       maxPerRun: CFG.maxStreamsPerRun || CFG.dailyPerTrack,
     });
   }
-  // up_tracks order decides the group: first groupASize = A (top 5-10), the rest = B (23-27)
-  return [...seen.values()].map((t, i) => ({ ...t, group: i < CFG.groupASize ? 'A' : 'B' }));
+  return [...seen.values()];
 }
 
 function sameWeek(raw, weekStart) {
@@ -826,14 +822,11 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch, custom 
 
     const targetTrackIds = new Set(rawTargets.map(t => t.key || t.id));
 
-    // Two groups (set in collectTracks from up_tracks order):
-    //   Group A -> goal: top ${groupATopMin}-${top10MaxRank}.
-    //     rank <= top10MaxRank                      -> top10       : reached goal, stop
-    //     rank > targetRangeMax / not trending      -> belowRange  : stream
-    //     rank 11..targetRangeMax (incl. 23-27)     -> pushToTop10 : already staged, keep pushing up
-    //   Group B -> goal: [targetRangeMin-targetRangeMax].
-    //     rank > targetRangeMax / not trending      -> belowRange  : stream
-    //     rank <= targetRangeMax                    -> inRange     : reached 23-27 (or higher), stop / hold
+    // Buckets:
+    //   belowRange  : rank > targetRangeMax OR not trending      → stream
+    //   inRange     : rank in [targetRangeMin, targetRangeMax]    → skip (in progress, don't disturb)
+    //   pushToTop10 : rank > top10MaxRank AND < targetRangeMin    → stream (above 23, not yet top 10)
+    //   top10       : rank <= top10MaxRank                        → skip (target reached)
     const belowRange   = [];
     const inRange      = [];
     const pushToTop10  = [];
@@ -841,20 +834,16 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch, custom 
 
     for (const t of rawTargets) {
       const rank = rankMap.get(t.id);
-      const reachedStage = rank !== undefined && rank <= CFG.targetRangeMax;
-      if (t.group === 'A') {
-        if (rank !== undefined && rank <= CFG.top10MaxRank) top10.push(t);
-        else if (!reachedStage) belowRange.push(t);
-        else pushToTop10.push(t);
+      if (rank === undefined || rank > CFG.targetRangeMax) {
+        belowRange.push(t);
+      } else if (rank >= CFG.targetRangeMin) {
+        inRange.push(t);
+      } else if (rank <= CFG.top10MaxRank) {
+        top10.push(t);
       } else {
-        if (reachedStage) inRange.push(t);
-        else belowRange.push(t);
+        pushToTop10.push(t);
       }
     }
-    // Group A gets served first
-    const aFirst = (x, y) => (x.group === 'A' ? 0 : 1) - (y.group === 'A' ? 0 : 1);
-    belowRange.sort(aFirst);
-    pushToTop10.sort(aFirst);
 
     // Fallback: if trending fetch returned nothing, we can't classify.
     // Warn and treat everything as belowRange so we still make progress.
@@ -885,13 +874,13 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch, custom 
     if (rawTargets.length) {
       const positions = rawTargets.map(t => {
         const r = rankMap.get(t.id);
-        return `${t.group || '?'}:${String(t.id).slice(0, 8)}:${r === undefined ? 'n/a' : `#${r}`}`;
+        return `${String(t.id).slice(0, 8)}:${r === undefined ? 'n/a' : `#${r}`}`;
       }).join(' ');
       log(`[*] Up_tracks positions: ${positions}`);
     }
-    log(`[*] Trending: group A (top ${CFG.groupATopMin}-${CFG.top10MaxRank}) ${top10.length} reached (skip), ` +
-        `${pushToTop10.length} staged/climbing (push); ` +
-        `group B (${CFG.targetRangeMin}-${CFG.targetRangeMax}) ${inRange.length} reached (skip); ` +
+    log(`[*] Trending: ${inRange.length} in [${CFG.targetRangeMin}-${CFG.targetRangeMax}] (skip), ` +
+        `${top10.length} in top ${CFG.top10MaxRank} (skip, target reached), ` +
+        `${pushToTop10.length} above ${CFG.targetRangeMin} but not yet top ${CFG.top10MaxRank} (push), ` +
         `${belowRange.length} below ${CFG.targetRangeMax}/not trending (stream)` +
         `${previousTargets.length ? `, ${previousTargets.length} previous-week [${CFG.trendingTopMin}-${CFG.trendingTopMax}] bonus` : ''}`);
 
@@ -902,8 +891,8 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch, custom 
     if (!targets.length) {
       const why = rawTargets.length === 0
         ? 'No up_tracks published'
-        : `All ${rawTargets.length} up_tracks are in their target zones ` +
-          `(A: top ${CFG.groupATopMin}-${CFG.top10MaxRank}, B: ${CFG.targetRangeMin}-${CFG.targetRangeMax})`;
+        : `All ${rawTargets.length} up_tracks are already in top ${CFG.top10MaxRank} ` +
+          `or in [${CFG.targetRangeMin}-${CFG.targetRangeMax}]`;
       log(`[*] ${why}. Nothing to stream.`);
       await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
         if (!h.batches) h.batches = [];
@@ -948,13 +937,6 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch, custom 
       if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: runNumber, done: true });
       return true;
     });
-    if (!custom) {
-      // Tracks still have daily allowance, so this run's per-run quota is what ran out
-      // (e.g. a cancelled run already used it). Close it and let the caller open the next run.
-      const diag = targets.map(t => `${t.group || '?'}:${String(t.id).slice(0, 6)} day ${todayDone.get(t.key) || 0}/${t.cap} run ${runDone.get(t.key) || 0}/${t.maxPerRun}`).join(' | ');
-      log(`[*] Run ${runNumber}: per-run quota already used (${diag}). Opening next run.`);
-      return { status: 'RUN_EXHAUSTED' };
-    }
     log(`[*] Run ${runNumber}: nothing left to attempt in this run.`);
     return { status: 'COMPLETED' };
   }
@@ -1059,15 +1041,7 @@ async function runStream({ now = new Date() } = {}) {
       log(allDoneMsg(published.length));
       return { status: 'ALREADY_COMPLETED' };
     }
-    let result;
-    let cur = coord;
-    for (let i = 0; i < 5; i++) {
-      result = await processRun(sb, ctx, rows, published, dayState(cur, ctx.today));
-      if (result.status !== 'RUN_EXHAUSTED') break;
-      rows = await fetchRows(sb);
-      cur = normalizeStream(rows.find(r => r.address === TARGET_ADDRESS).stream, ctx.weekStart);
-    }
-    return result.status === 'RUN_EXHAUSTED' ? { status: 'COMPLETED' } : result;
+    return await processRun(sb, ctx, rows, published, dayState(coord, ctx.today));
   } finally {
     stopHeartbeat();
     HELD_LOCK = null;
