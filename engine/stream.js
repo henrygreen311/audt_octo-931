@@ -948,6 +948,13 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch, custom 
       if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: runNumber, done: true });
       return true;
     });
+    if (!custom) {
+      // Tracks still have daily allowance, so this run's per-run quota is what ran out
+      // (e.g. a cancelled run already used it). Close it and let the caller open the next run.
+      const diag = targets.map(t => `${t.group || '?'}:${String(t.id).slice(0, 6)} day ${todayDone.get(t.key) || 0}/${t.cap} run ${runDone.get(t.key) || 0}/${t.maxPerRun}`).join(' | ');
+      log(`[*] Run ${runNumber}: per-run quota already used (${diag}). Opening next run.`);
+      return { status: 'RUN_EXHAUSTED' };
+    }
     log(`[*] Run ${runNumber}: nothing left to attempt in this run.`);
     return { status: 'COMPLETED' };
   }
@@ -1052,7 +1059,15 @@ async function runStream({ now = new Date() } = {}) {
       log(allDoneMsg(published.length));
       return { status: 'ALREADY_COMPLETED' };
     }
-    return await processRun(sb, ctx, rows, published, dayState(coord, ctx.today));
+    let result;
+    let cur = coord;
+    for (let i = 0; i < 5; i++) {
+      result = await processRun(sb, ctx, rows, published, dayState(cur, ctx.today));
+      if (result.status !== 'RUN_EXHAUSTED') break;
+      rows = await fetchRows(sb);
+      cur = normalizeStream(rows.find(r => r.address === TARGET_ADDRESS).stream, ctx.weekStart);
+    }
+    return result.status === 'RUN_EXHAUSTED' ? { status: 'COMPLETED' } : result;
   } finally {
     stopHeartbeat();
     HELD_LOCK = null;
