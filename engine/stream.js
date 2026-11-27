@@ -141,7 +141,7 @@ const CFG = {
   timezone: process.env.RESET_TIMEZONE || 'America/Los_Angeles',
   resetHour: Number(process.env.RESET_HOUR ?? 12),
   dayTimezone: process.env.DAY_TIMEZONE || 'Africa/Lagos',
-  dailyPerTrack: Number(process.env.DAILY_STREAMS_PER_TRACK || 1000),
+  dailyPerTrack: Number(process.env.DAILY_STREAMS_PER_TRACK || 10000),
   maxStreamsPerRun: Number(process.env.MAX_STREAMS_PER_RUN || process.env.MAX_STREAMS_PER_RUN_TODAY || 100),
   streamDurationMs: Number(process.env.STREAM_DURATION_MS || STREAM_DURATION_MS),
   streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
