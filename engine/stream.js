@@ -8,6 +8,10 @@ const DEFAULT_STREAM_DURATION_SEC = 30;
 const FEED_TRACK_MAX_AGE_MS = 24 * 3600 * 1000;
 const STATE_VERSION_MAX_TRACKS = 1000;
 
+// Rank zones (positions on the Audius trending chart)
+const ZONE_A = { min: 5, max: 10 };   // group A: climb all the way into the top 5-10
+const ZONE_B = { min: 23, max: 27 };  // group B: climb into 23-27, then hold
+
 // ============ IMPORTS ============
 const fs = require('fs');
 const os = require('os');
@@ -112,6 +116,12 @@ const CFG = {
   rateWaitMs: Number(process.env.RATE_WAIT_MS || 3000),
   lockTtlMs: Number(process.env.STREAM_LOCK_TTL_MINUTES || 60) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
+  // rank-driven mode
+  rankTime: process.env.RANK_TIME || 'week',                          // trending window: week | month | year | allTime
+  rankDepth: Number(process.env.RANK_DEPTH || 100),                   // how deep in the chart to look for our tracks
+  rankBurst: Number(process.env.RANK_BURST || 100),                   // streams per active track between rank checks
+  rankSettleMs: Number(process.env.RANK_SETTLE_SECONDS || 30) * 1000, // wait for the chart to update before re-checking
+  rankMaxRounds: Number(process.env.RANK_MAX_ROUNDS || 200),
 };
 
 // ============ UTILITIES ============
@@ -439,8 +449,39 @@ async function streamOnce(acct, trackId) {
   }
 }
 
+// ============ RANK ============
+// Rank = position on the Audius trending chart (1 = top). null = not in the top `rankDepth`.
+async function fetchRanks(ids) {
+  const wanted = new Set(ids.map(String));
+  const ranks = {};
+  for (const id of wanted) ranks[id] = null;
+  const PAGE = 100;
+  for (let offset = 0; offset < CFG.rankDepth; offset += PAGE) {
+    const url = `https://api.audius.co/v1/tracks/trending?time=${encodeURIComponent(CFG.rankTime)}&limit=${PAGE}&offset=${offset}&app_name=tastemaker`;
+    const body = await withRetry(() => withTimeout((async () => {
+      const res = await fetch(url, { headers: { Accept: 'application/json' } });
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+      return res.json();
+    })(), CFG.callTimeoutMs, 'trending chart'));
+    const list = (body && body.data) || [];
+    list.forEach((t, i) => {
+      const id = String(t.id);
+      if (wanted.has(id)) ranks[id] = offset + i + 1;
+    });
+    if (list.length < PAGE) break;
+  }
+  return ranks;
+}
+
+// 'climb' = keep streaming | 'in-zone' = reached target zone, stop | 'above' = already past it, stop
+function zoneStatus(zone, rank) {
+  if (rank == null || rank > zone.max) return 'climb';
+  if (rank >= zone.min) return 'in-zone';
+  return 'above';
+}
+
 // ============ RUN ============
-async function runStreams({ tracks, target, excludeUser } = {}) {
+async function runStreams({ tracks, target, excludeUser, groups } = {}) {
   if (!Array.isArray(tracks) || !tracks.length) {
     return { status: 'OK', streams: 0 };
   }
@@ -492,29 +533,22 @@ async function runStreams({ tracks, target, excludeUser } = {}) {
     let totalDone = 0;
     let totalFailed = 0;
 
-    for (const t of tracks) {
-      if (STREAM_LOCK_LOST) break;
-      const trackId = String(t.id);
-      const titlePart = t.title ? ` "${String(t.title).slice(0, 40)}"` : '';
+    const MAX_ITERATIONS = 60;
+    const titleOf = {};
+    for (const t of tracks) titleOf[String(t.id)] = t.title ? ` "${String(t.title).slice(0, 40)}"` : '';
 
-      if (!state.streams[trackId]) {
-        state.streams[trackId] = { count: 0, updated_at: new Date().toISOString() };
-      }
+    // Stream `want` more plays on one track (bounded by the per-track cap `n`). Returns plays done.
+    const burstTrack = async (trackId, want) => {
+      if (!state.streams[trackId]) state.streams[trackId] = { count: 0, updated_at: new Date().toISOString() };
       const entry = state.streams[trackId];
-
-      if (entry.count >= n) {
-        log(`[*] Stream: track ${trackId}${titlePart} already complete (${entry.count}/${n}).`);
-        continue;
-      }
-
+      let done = 0;
       let iterations = 0;
       let consecutiveWaits = 0;
-      const MAX_ITERATIONS = 60;
 
-      while (entry.count < n) {
+      while (done < want && entry.count < n) {
         if (STREAM_LOCK_LOST) break;
         if (++iterations > MAX_ITERATIONS) {
-          log(`[!] Stream: track ${trackId}${titlePart} hit batch cap (${entry.count}/${n}).`);
+          log(`[!] Stream: track ${trackId}${titleOf[trackId] || ''} hit batch cap (${entry.count}/${n}).`);
           break;
         }
 
@@ -522,7 +556,7 @@ async function runStreams({ tracks, target, excludeUser } = {}) {
         const available = pool.filter(a => !isOnCooldown(state, a.address));
         if (!available.length) {
           if (++consecutiveWaits > 10) {
-            log(`[!] Stream: track ${trackId}${titlePart} — all accounts stuck on cooldown; stopping.`);
+            log(`[!] Stream: track ${trackId}${titleOf[trackId] || ''} — all accounts stuck on cooldown; stopping.`);
             break;
           }
           await sleep(CFG.rateWaitMs);
@@ -530,7 +564,7 @@ async function runStreams({ tracks, target, excludeUser } = {}) {
         }
         consecutiveWaits = 0;
 
-        const need = n - entry.count;
+        const need = Math.min(want - done, n - entry.count);
         const batch = shuffle(available).slice(0, Math.min(need, CFG.streamConcurrency));
 
         let rateLimited = 0;
@@ -538,6 +572,7 @@ async function runStreams({ tracks, target, excludeUser } = {}) {
           try {
             await streamOnce(acct, trackId);
             entry.count++;
+            done++;
             entry.updated_at = new Date().toISOString();
             totalDone++;
           } catch (e) {
@@ -552,11 +587,84 @@ async function runStreams({ tracks, target, excludeUser } = {}) {
         }));
 
         await saveFn();
-
         if (rateLimited > 0) await sleep(CFG.rateWaitMs);
       }
+      return done;
+    };
 
-      log(`[*] Stream: track ${trackId}${titlePart} → ${entry.count}/${n}.`);
+    if (groups) {
+      // ---------- RANK-DRIVEN MODE (two groups) ----------
+      // Group A: keep streaming until the track is inside the top 5-10 (passing through 23-27 on the way).
+      // Group B: keep streaming until the track reaches 23-27, then stop. If it slips back below 27 it resumes.
+      const A = groups.a.map(String);
+      const B = groups.b.map(String);
+      const all = [...A, ...B];
+      const staged = new Set();
+      let rankFails = 0;
+
+      log(`[*] Rank mode: group A (${A.length}) → top ${ZONE_A.min}-${ZONE_A.max} | group B (${B.length}) → top ${ZONE_B.min}-${ZONE_B.max} | chart=${CFG.rankTime}.`);
+
+      for (let round = 1; round <= CFG.rankMaxRounds; round++) {
+        if (STREAM_LOCK_LOST) break;
+
+        let ranks;
+        try {
+          ranks = await fetchRanks(all);
+          rankFails = 0;
+        } catch (e) {
+          if (++rankFails >= 3) { log(`[!] Rank: chart unavailable (${errMsg(e).slice(0, 60)}); aborting.`); return { status: 'ERROR' }; }
+          log(`[!] Rank: chart fetch failed (${errMsg(e).slice(0, 60)}); retrying.`);
+          await sleep(CFG.rankSettleMs);
+          continue;
+        }
+
+        const active = [];
+        const lines = [];
+        for (const [grp, ids, zone] of [['A', A, ZONE_A], ['B', B, ZONE_B]]) {
+          for (const id of ids) {
+            const rank = ranks[id];
+            const st = zoneStatus(zone, rank);
+            const capped = (state.streams[id] ? state.streams[id].count : 0) >= n;
+
+            // Group A: note when a track has reached the 23-27 staging band and is being pushed on
+            if (grp === 'A' && st === 'climb' && rank != null && rank >= ZONE_B.min && rank <= ZONE_B.max && !staged.has(id)) {
+              staged.add(id);
+              log(`[*] Rank: A ${id} reached #${rank} (${ZONE_B.min}-${ZONE_B.max}) → pushing on to top ${ZONE_A.min}-${ZONE_A.max}.`);
+            }
+
+            lines.push(`${grp}:${id.slice(0, 6)} #${rank == null ? `>${CFG.rankDepth}` : rank} ${st}${st === 'climb' && capped ? ' (cap hit)' : ''}`);
+            if (st === 'climb' && !capped) active.push(id);
+          }
+        }
+        log(`[*] Rank round ${round}: ${lines.join(' | ')}`);
+
+        const pending = lines.filter(l => / climb/.test(l)).length;
+        if (!pending) { log('[*] Rank: both groups are in their target zones. Done.'); break; }
+        if (!active.length) { log('[!] Rank: remaining tracks hit the per-track stream cap; stopping.'); break; }
+
+        // Group A first, then B
+        for (const id of active) {
+          if (STREAM_LOCK_LOST) break;
+          const did = await burstTrack(id, CFG.rankBurst);
+          log(`[*] Stream: ${A.includes(id) ? 'A' : 'B'} ${id}${titleOf[id] || ''} +${did} (${state.streams[id].count}/${n}).`);
+        }
+
+        await sleep(CFG.rankSettleMs); // let the chart catch up before re-checking
+      }
+    } else {
+      // ---------- PLAIN MODE (original behaviour: fixed count per track) ----------
+      for (const t of tracks) {
+        if (STREAM_LOCK_LOST) break;
+        const trackId = String(t.id);
+        if (!state.streams[trackId]) state.streams[trackId] = { count: 0, updated_at: new Date().toISOString() };
+        const entry = state.streams[trackId];
+        if (entry.count >= n) {
+          log(`[*] Stream: track ${trackId}${titleOf[trackId]} already complete (${entry.count}/${n}).`);
+          continue;
+        }
+        await burstTrack(trackId, n - entry.count);
+        log(`[*] Stream: track ${trackId}${titleOf[trackId]} → ${entry.count}/${n}.`);
+      }
     }
 
     await saveFn();
@@ -573,36 +681,58 @@ async function runStreams({ tracks, target, excludeUser } = {}) {
 }
 
 // ============ CLI ============
-// Usage: ./stream.js track=id1,id2 target=1000 [--verbose]
+// Rank mode (default):
+//   ./stream.js track=id1,...,id10 [split=5] [target=1000]
+//     first `split` tracks (default 5) = group A → top 5-10
+//     the rest                       = group B → top 23-27
+//   ./stream.js a=id1,id2 b=id3,id4 [target=1000]      (explicit groups)
+// Plain mode (old behaviour, fixed count per track):
+//   ./stream.js track=id1,id2 --plain [target=1000]
 if (require.main === module) {
   const args = process.argv.slice(2);
-  const trackArg = args.find(a => /^track=/i.test(a));
-  const targetArg = args.find(a => /^target=/i.test(a));
+  const get = k => { const a = args.find(x => new RegExp(`^${k}=`, 'i').test(x)); return a ? a.slice(a.indexOf('=') + 1).trim() : null; };
+  const list = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
+  const plain = args.includes('--plain');
 
-  if (!trackArg) {
-    console.error('[!] Usage: ./stream.js track=id1,id2 [target=1000] [--verbose]');
+  const trackIds = list(get('track'));
+  let A = list(get('a'));
+  let B = list(get('b'));
+
+  if (!trackIds.length && !A.length && !B.length) {
+    console.error('[!] Usage: ./stream.js track=id1,...,id10 [split=5] [target=1000] [--plain] [--verbose]\n    or: ./stream.js a=ids b=ids [target=1000]');
     process.exit(1);
   }
 
-  const trackIds = trackArg.slice(trackArg.indexOf('=') + 1).split(',')
-    .map(s => s.trim()).filter(Boolean);
-  if (!trackIds.length) {
+  let groups = null;
+  let ids = trackIds;
+  if (!plain) {
+    if (!A.length && !B.length) {
+      const split = Math.max(0, parseInt(get('split') || '5', 10) || 5);
+      A = trackIds.slice(0, split);
+      B = trackIds.slice(split);
+    }
+    groups = { a: A, b: B };
+    ids = [...A, ...B];
+  }
+  if (!ids.length) {
     console.error('[!] No track IDs supplied.');
     process.exit(1);
   }
 
   let target = DEFAULT_STREAM_TARGET;
-  if (targetArg) {
-    const raw = targetArg.slice(targetArg.indexOf('=') + 1).trim().toLowerCase();
-    const m = raw.match(/^(\d+(?:\.\d+)?)([kmb])?$/);
+  const targetRaw = get('target');
+  if (targetRaw) {
+    const m = targetRaw.toLowerCase().match(/^(\d+(?:\.\d+)?)([kmb])?$/);
     if (m) {
       const mult = m[2] === 'k' ? 1000 : m[2] === 'm' ? 1000000 : m[2] === 'b' ? 1000000000 : 1;
       target = Math.floor(parseFloat(m[1]) * mult) || DEFAULT_STREAM_TARGET;
     }
   }
 
-  log(`[*] Stream CLI: ${trackIds.length} track(s) × ${target} stream(s) each.`);
-  runStreams({ tracks: trackIds.map(id => ({ id })), target, excludeUser: null })
+  log(groups
+    ? `[*] Stream CLI (rank mode): A=${groups.a.length} B=${groups.b.length} track(s), cap ${target} stream(s) each.`
+    : `[*] Stream CLI: ${ids.length} track(s) × ${target} stream(s) each.`);
+  runStreams({ tracks: ids.map(id => ({ id })), target, excludeUser: null, groups })
     .then(r => {
       log(`[*] Stream CLI finished: ${JSON.stringify(r)}`);
       process.exit(r.status === 'OK' ? 0 : 1);
@@ -618,4 +748,6 @@ module.exports = {
   buildContext,
   CFG,
   streamOnce,
+  fetchRanks,
+  zoneStatus,
 };
