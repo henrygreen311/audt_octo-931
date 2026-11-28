@@ -169,12 +169,10 @@ const CFG = {
   commentsPerTrack: Number(process.env.COMMENTS_PER_TRACK || DEFAULT_COMMENTS_PER_TRACK),
   focusMaxTracks: Number(process.env.FOCUS_MAX_TRACKS || 0),
   streamDurationMs: Number(process.env.STREAM_DURATION_SECONDS || 30) * 1000, // used only for the stream= hint
-  // Explore (BPM) discovery — replaces the user feed in no-param mode
-  bpmRanges: (process.env.BPM_RANGES || '1-79,80-99,100-119,120-139,140-300')
-    .split(',').map(x => x.trim()).filter(Boolean)
-    .map(x => { const [a, b] = x.split('-').map(Number); return { min: a, max: b }; })
-    .filter(r => Number.isFinite(r.min) && Number.isFinite(r.max)),
-  exploreLimit: Number(process.env.EXPLORE_LIMIT || 25),                  // newest tracks pulled per BPM range
+  // Newest-tracks discovery (/tracks/latest) — replaces the user feed in no-param mode
+  latestLimit: Number(process.env.LATEST_LIMIT || 50),                    // newest tracks pulled from /tracks/latest
+  exploreRetries: Number(process.env.EXPLORE_RETRIES || 4),                // attempts per cycle before the normal backoff kicks in
+  exploreRetryWaitMs: Number(process.env.EXPLORE_RETRY_WAIT_SECONDS || 10) * 1000,
   exploreMaxAgeMs: Number(process.env.EXPLORE_MAX_AGE_MINUTES || 5) * 60000,
   exploreTrackCount: Number(process.env.EXPLORE_TRACK_COUNT || 5),        // tracks engaged per cycle
   _feedTarget: null,
@@ -760,45 +758,49 @@ async function fetchFeed(userId, limit = CFG.feedLimit) {
   return audiusGet(path, 'feed', CFG.feedTimeoutMs);
 }
 
-// Explore "most recent" needs a genre; BPM filters work instead. Calls every BPM range
-// (newest first), merges them, then keeps the newest tracks that are younger than
-// exploreMaxAgeMs and have 0 favorites and 0 reposts.
-async function fetchExploreTracks() {
-  const ranges = CFG.bpmRanges;
-  if (!ranges.length) throw new Error('no valid BPM_RANGES configured');
-  const results = await Promise.allSettled(ranges.map(r =>
-    audiusGet(`/v1/tracks/search?sort_method=recent&bpm_min=${r.min}&bpm_max=${r.max}&limit=${CFG.exploreLimit}&app_name=tastemaker`,
-      `explore bpm ${r.min}-${r.max}`, CFG.feedTimeoutMs)));
-
-  const failed = results.filter(r => r.status === 'rejected');
-  if (failed.length === results.length) throw failed[0].reason;
-  if (failed.length) log(`[!] Explore: ${failed.length}/${results.length} BPM call(s) failed; using the rest.`);
-
-  const seen = new Map();
-  for (const r of results) {
-    if (r.status !== 'fulfilled') continue;
-    for (const t of (Array.isArray(r.value) ? r.value : [])) {
-      if (t && t.id && !seen.has(String(t.id))) seen.set(String(t.id), t);
-    }
-  }
-
+// Newest tracks from ALL users. Source: /v1/tracks/latest (all users, newest first, no genre needed).
+// On failure it waits and retries. The filter applies: younger than exploreMaxAgeMs, 0 favorites, 0 reposts, publicly streamable.
+function pickFreshTracks(list) {
   const now = Date.now();
+  const seen = new Map();
+  for (const t of list) {
+    if (t && t.id && !seen.has(String(t.id))) seen.set(String(t.id), t);
+  }
   const fresh = [...seen.values()].filter(t => {
     const created = Date.parse(t.created_at || '');
     if (!Number.isFinite(created)) return false;
     const age = now - created;
-    if (age < 0 || age > CFG.exploreMaxAgeMs) return false;
+    if (age < 0 || age > CFG.exploreMaxAgeMs) return false;       // too old, or scheduled for the future
+    if (t.is_unlisted || t.is_delete || t.is_available === false) return false;
+    if (t.is_stream_gated || t.stream_conditions) return false;   // premium / gated: can't be engaged normally
     return Number(t.favorite_count || 0) === 0 && Number(t.repost_count || 0) === 0;
   }).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+  return { unique: seen.size, fresh };
+}
 
-  log(`[*] Explore: ${ranges.length} BPM range(s) → ${seen.size} unique track(s) → ${fresh.length} under ${Math.round(CFG.exploreMaxAgeMs / 60000)}m old with no fav/repost.`);
+const toTrack = t => ({ id: String(t.id), user: t.user || {}, title: t.title || '', created_at: t.created_at || null });
 
-  return fresh.slice(0, CFG.exploreTrackCount).map(t => ({
-    id: String(t.id),
-    user: t.user || {},
-    title: t.title || '',
-    created_at: t.created_at || null,
-  }));
+async function fetchLatestTracks() {
+  const list = await audiusGet(`/v1/tracks/latest?limit=${CFG.latestLimit}&app_name=tastemaker`, 'latest tracks', CFG.feedTimeoutMs);
+  if (!Array.isArray(list)) throw new Error('unexpected /tracks/latest response');
+  return list;
+}
+
+async function fetchExploreTracks() {
+  let list;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      list = await fetchLatestTracks();
+      break;
+    } catch (e) {
+      if (attempt >= CFG.exploreRetries) throw e;
+      log(`[!] Explore: /tracks/latest failed (${errMsg(e).slice(0, 60)}); waiting ${Math.round(CFG.exploreRetryWaitMs * attempt / 1000)}s, retry ${attempt}/${CFG.exploreRetries - 1}.`);
+      await sleep(CFG.exploreRetryWaitMs * attempt);
+    }
+  }
+  const { unique, fresh } = pickFreshTracks(list);
+  log(`[*] Explore: ${unique} unique track(s) → ${fresh.length} under ${Math.round(CFG.exploreMaxAgeMs / 60000)}m old with no fav/repost.`);
+  return fresh.slice(0, CFG.exploreTrackCount).map(toTrack);
 }
 
 async function fetchUserByHandle(handle) {
@@ -1171,7 +1173,7 @@ async function doFeedInteract(sb, ctx, state, pool, primary, focus) {
       return;
     }
     recordFeedSuccess(state);
-    trackSource = 'explore (BPM, newest)';
+    trackSource = 'explore (newest)';
   }
 
   if (!tracks.length) {

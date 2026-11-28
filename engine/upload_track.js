@@ -62,6 +62,12 @@ const CFG = {
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   // A lock of unknown ownership with no data recorded for today is treated as stale after this long (0 = off).
   lockIdleMs: Number(process.env.LOCK_IDLE_MINUTES ?? 10) * 60000,
+  // Heartbeat: a running process refreshes lock.heartbeat_at every lockHeartbeatMs. A lock whose heartbeat is
+  // older than lockHeartbeatStaleMs belongs to a dead run and is taken over straight away (no 2h wait).
+  lockHeartbeatMs: Number(process.env.LOCK_HEARTBEAT_SECONDS || 30) * 1000,
+  lockHeartbeatStaleMs: Number(process.env.LOCK_HEARTBEAT_STALE_SECONDS || 120) * 1000,
+  forceUnlock: process.env.FORCE_UNLOCK === '1', // take over whatever lock exists (use only when the old run is definitely dead)
+  dbTimeoutMs: Number(process.env.DB_TIMEOUT_SECONDS || 30) * 1000,
   genTimeoutMs: Number(process.env.GEN_TIMEOUT_MINUTES || 60) * 60000,
   genTopUpAttempts: Number(process.env.GEN_TOPUP_ATTEMPTS ?? 1),
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
@@ -308,7 +314,17 @@ function connectSupabase() {
   const urlMatch = dbText.match(/SUPABASE_URL\s*=\s*["']([^"']+)["']/);
   const keyMatch = dbText.match(/SUPABASE_KEY\s*=\s*["']([^"']+)["']/);
   if (!urlMatch || !keyMatch) throw new Error('Could not read SUPABASE_URL / SUPABASE_KEY from db.txt');
-  return createClient(urlMatch[1], keyMatch[1]);
+  // Every database request gets a timeout, so a hung connection fails (and is retried) instead of
+  // leaving the script silent until the runner marks it stale.
+  const dbFetch = (input, init = {}) => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), CFG.dbTimeoutMs);
+    if (init.signal) init.signal.addEventListener('abort', () => ctl.abort(), { once: true });
+    return fetch(input, { ...init, signal: ctl.signal })
+      .catch(e => { throw ctl.signal.aborted ? new Error(`database request timed out after ${CFG.dbTimeoutMs / 1000}s`) : e; })
+      .finally(() => clearTimeout(t));
+  };
+  return createClient(urlMatch[1], keyMatch[1], { global: { fetch: dbFetch } });
 }
 
 const anyErr = () => true;
@@ -339,9 +355,18 @@ async function readRow(sb, address) {
 // can never overwrite the new owner's data.
 let HELD_LOCK = null;
 
+// In-process mutex: the heartbeat timer and the main flow both read-modify-write the same row,
+// so they must never interleave (other processes are fenced by the lock token).
+let DB_CHAIN = Promise.resolve();
+function withDbMutex(fn) {
+  const run = DB_CHAIN.then(fn, fn);
+  DB_CHAIN = run.catch(() => {});
+  return run;
+}
+
 // Read-modify-write of the single history row (TARGET_ADDRESS).
 async function updateHistory(sb, weekStart, mutate) {
-  return withRetry(`db update ${TARGET_ADDRESS}`, async () => {
+  return withRetry(`db update ${TARGET_ADDRESS}`, () => withDbMutex(async () => {
     const row = await readRow(sb, TARGET_ADDRESS);
     if (!row) throw new Error(`history row not found: ${TARGET_ADDRESS}`);
     const hist = normalizeHistory(row.up_tracks, weekStart);
@@ -358,7 +383,7 @@ async function updateHistory(sb, weekStart, mutate) {
       throw new Error(`update affected ${data ? data.length : 0} rows`);
     }
     return normalizeHistory(data[0].up_tracks, weekStart); // value as stored by the database
-  }, { retryIf: e => !(e instanceof LockLostError) });
+  }), { retryIf: e => !(e instanceof LockLostError) });
 }
 
 // Insert/update today's record for an account and verify what the database stored.
@@ -423,10 +448,17 @@ function hasDataForToday(rows, ctx) {
 
 // Returns why an existing lock may be taken over, or null if it must be respected.
 function staleLockReason(lock, rows, ctx) {
+  if (CFG.forceUnlock) return 'FORCE_UNLOCK=1 is set';
   if (!(Date.parse(lock.expires_at) > Date.now())) return 'it expired';
   const alive = lockOwnerAlive(lock);
-  if (alive === true) return null;                      // live owner on this machine: never take over
   if (alive === false) return 'its owner process is no longer running';
+  // Heartbeat: a live run refreshes heartbeat_at every ~30s; silence means the run is dead.
+  if (lock.heartbeat_at) {
+    const silent = Date.now() - Date.parse(lock.heartbeat_at);
+    if (silent >= CFG.lockHeartbeatStaleMs) return `no heartbeat for ${Math.round(silent / 1000)}s (the run stopped)`;
+    return null;                                        // recent heartbeat: the run is alive
+  }
+  if (alive === true) return null;                      // legacy lock, live owner on this machine
   // Owner unknown: look at the data. Nothing recorded for today ("days": []) means no work
   // to protect, so a lock that old is a leftover of a run that died before saving anything.
   const age = Date.now() - Date.parse(lock.acquired_at);
@@ -453,6 +485,7 @@ async function acquireLock(sb, rows, ctx) {
   const token = crypto.randomUUID();
   const lock = {
     token, acquired_at: new Date().toISOString(), expires_at: new Date(Date.now() + CFG.lockTtlMs).toISOString(),
+    heartbeat_at: new Date().toISOString(),
     pid: process.pid, host: os.hostname(),
   };
   const next = isObj(raw) ? { ...raw, lock } : { week_start: ctx.weekStart, days: [], lock };
@@ -472,17 +505,32 @@ async function acquireLock(sb, rows, ctx) {
 }
 
 async function renewLock(sb, lock) {
-  await withRetry('renew lock', async () => {
+  await withRetry('renew lock', () => withDbMutex(async () => {
     const row = await readRow(sb, lock.address);
     const raw = row && row.up_tracks;
     const cur = isObj(raw) && isObj(raw.lock) ? raw.lock : null;
     if (!cur || cur.token !== lock.token) throw new LockLostError('batch lock was taken over by another run');
-    const next = { ...raw, lock: { ...cur, expires_at: new Date(Date.now() + CFG.lockTtlMs).toISOString() } };
+    const next = { ...raw, lock: { ...cur, expires_at: new Date(Date.now() + CFG.lockTtlMs).toISOString(), heartbeat_at: new Date().toISOString() } };
     const { data, error } = await sb.from('audius').update({ up_tracks: next })
       .eq('address', lock.address).eq('up_tracks->lock->>token', lock.token).select('address');
     if (error) throw new Error(error.message);
     if (!data || data.length !== 1) throw new LockLostError('batch lock was taken over by another run');
-  }, { retryIf: e => !(e instanceof LockLostError) });
+  }), { retryIf: e => !(e instanceof LockLostError) });
+}
+
+// Background heartbeat while this run holds the lock. Returns a stop() function.
+function startHeartbeat(sb, lock) {
+  if (!(CFG.lockHeartbeatMs > 0)) return () => {};
+  let stopped = false;
+  const timer = setInterval(() => {
+    if (stopped) return;
+    renewLock(sb, lock).catch(e => {
+      if (e instanceof LockLostError) { stopped = true; clearInterval(timer); log('[!] Heartbeat: batch lock was taken over by another run.'); }
+      else console.error(`[!] Heartbeat failed (will retry): ${String(e.message || e).slice(0, 80)}`);
+    });
+  }, CFG.lockHeartbeatMs);
+  if (timer.unref) timer.unref();
+  return () => { stopped = true; clearInterval(timer); };
 }
 
 async function releaseLock(sb, lock) {
@@ -947,6 +995,7 @@ function printSummary(ctx, accounts, tracksCount, status, failures) {
 async function runDaily({ now = new Date() } = {}) {
   const ctx = buildContext(now);
   const sb = connectSupabase();
+  log('[*] Connecting to database...');
   // 1. Duplicate-run check against the database BEFORE generating or selecting anything.
   let rows = await fetchAllRows(sb);
   if (!rows.length) throw new Error('audius table returned no accounts');
@@ -962,6 +1011,7 @@ async function runDaily({ now = new Date() } = {}) {
   const lock = await acquireLock(sb, rows, ctx);
   if (!lock) return { status: 'LOCKED' };
   HELD_LOCK = lock;
+  const stopHeartbeat = startHeartbeat(sb, lock);
 
   try {
     // 3. Re-check under the lock, then handle the weekly reset and interrupted runs.
@@ -1081,6 +1131,8 @@ async function runDaily({ now = new Date() } = {}) {
     printSummary(ctx, accounts, tracks.length, complete ? 'COMPLETED' : 'INCOMPLETE (re-run to recover)', failures);
     return { status: complete ? 'COMPLETED' : 'INCOMPLETE' };
   } finally {
+    stopHeartbeat();
+    await withDbMutex(async () => {});   // let an in-flight heartbeat finish before releasing
     HELD_LOCK = null;
     await releaseLock(sb, lock);
   }
